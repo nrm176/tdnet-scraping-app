@@ -45,7 +45,16 @@ TDNET_DOWNLOAD_ROOT=/Volumes/yakushimachi/Downloads
 
 ## CLI Workflows
 
-Run the default end-to-end pipeline:
+**Parked (2026-10-25):** the legacy tdnet-postgres database this section's
+commands write to is retired. `scripts/tdnet_all_in_one.sh` (with or without
+`--legacy-local`) and every `tdnet` subcommand below that writes the legacy
+DB now refuse to run with a clear message instead of doing anything --
+see `tdnet/database.py`. TDnet disclosure history now lives in the research
+database's `raw_tdnet_history`; document download/parse will move there
+under Root issue #50. The code is kept, not deleted (`TDNET_LEGACY_LOCAL_ENABLED=1`
+re-enables the Python-side guard deliberately; the shell script needs its
+early-exit block removed by hand). Do not try to run these commands expecting
+them to persist data -- the examples below are historical/reference only.
 
 ```bash
 scripts/tdnet_all_in_one.sh
@@ -99,7 +108,9 @@ Read-only TDnet API:
 uvicorn tdnet.api:app --reload
 ```
 
-Review/search app:
+Review/search app (**parked 2026-10-25** -- `app/backend` reads the retired
+legacy DB and now refuses to start; see `app/backend/main.py` and
+`tdnet/database.py`):
 
 ```bash
 ./app/dev.sh

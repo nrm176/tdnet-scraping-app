@@ -29,8 +29,9 @@ The canonical daily entry point is:
 scripts/tdnet_daily_metadata.sh --date 2026-09-10
 ```
 
-The broad `tdnet_all_in_one.sh` workflow is legacy and requires explicit
-`--legacy-local` opt-in; it is not part of the daily metadata path.
+The broad `tdnet_all_in_one.sh` workflow is legacy and parked (2026-10-25): it
+now refuses to run regardless of the `--legacy-local` opt-in (see
+`tdnet/database.py`); it was never part of the daily metadata path.
 
 ```sh
 cd "$(git rev-parse --show-toplevel)"

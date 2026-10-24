@@ -4,11 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-if [[ "${1:-}" != "--legacy-local" ]]; then
-  echo "This broad local pipeline is legacy; pass --legacy-local explicitly." >&2
-  exit 2
-fi
-shift
+# PARKED (2026-10-25): this --legacy-local pipeline is disabled, not deleted.
+# It always refuses to run now, whether or not --legacy-local is passed --
+# see tdnet/database.py for the matching Python-side guard
+# (TDNET_LEGACY_LOCAL_ENABLED) that this script would otherwise hit anyway
+# once it reached the first `tdnet` subcommand.
+cat >&2 <<'EOF'
+The legacy tdnet-postgres pipeline is retired (2026-10-25). TDnet disclosure
+history now lives in the research database's raw_tdnet_history (see
+docs/runbooks/tdnet-history.md in the hedge-fund-takedo repo). Document
+download/parse against this local database will move to the research DB
+under Root issue #50.
+
+This script is parked, not deleted -- set TDNET_LEGACY_LOCAL_ENABLED=1 and
+re-enable the guard in tdnet/database.py to run it deliberately.
+
+For the normal daily TDnet entry, use scripts/tdnet_daily_metadata.sh instead.
+EOF
+exit 2
 
 DAYS="30"
 START_DATE=""
