@@ -64,6 +64,17 @@ Some workflows use `uv run --extra layout ...` when the optional `pymupdf-layout
 
 ## Core Commands
 
+**Parked (2026-10-25):** the legacy tdnet-postgres database (`DATABASE_URL`
+above) is retired. `scripts/tdnet_all_in_one.sh` (all variants below) and the
+`tdnet` subcommands that write to it, plus the `app/backend` review/search
+FastAPI backend, now refuse to run with a clear message -- see
+`tdnet/database.py`. TDnet disclosure history now lives in the research
+database's `raw_tdnet_history`; document download/parse will move there under
+Root issue #50. The code is kept, not deleted
+(`TDNET_LEGACY_LOCAL_ENABLED=1` re-enables the Python-side guard
+deliberately; the shell script needs its early-exit block removed by hand).
+Don't expect the commands below to persist data or start the review app.
+
 Run the default end-to-end pipeline:
 
 ```bash

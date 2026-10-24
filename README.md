@@ -88,7 +88,16 @@ there either -- every other field in every endpoint comes from
 `id`/`file_id`/`parse_job_id` values are the raw tables' `legacy_id`/
 `file_legacy_id`/`parse_job_legacy_id` columns).
 
-## Review web app
+## Review web app (parked)
+
+**Parked (2026-10-25):** `app/backend` is the legacy tdnet-postgres review
+workbench. The legacy database it reads is retired; starting the backend now
+fails fast with a clear message instead of connecting to Postgres (see
+`app/backend/main.py` and `tdnet/database.py`). The code is kept, not
+deleted -- set `TDNET_LEGACY_LOCAL_ENABLED=1` to re-enable it deliberately.
+Moving document download/parse and review onto the research DB is a separate
+future project (Root issue #50). The rest of this section describes the
+parked behavior.
 
 The parsed-text review UI lives under `app/`:
 
@@ -140,7 +149,9 @@ scripts/tdnet_daily_metadata.sh --date 2026-09-10
 ```
 
 The following direct commands are legacy/component operations for source-local
-maintenance and are not the normal daily entry:
+maintenance and are not the normal daily entry. **Parked (2026-10-25):** every
+one of these that writes the legacy database (all but plain `scrape` without
+`--persist`) now refuses to run -- see "Legacy local pipeline (parked)" below.
 
 ```bash
 tdnet scrape --date 2026-05-15 --output-format structured
@@ -150,8 +161,23 @@ tdnet download --limit 100
 tdnet parse --limit 100 --workers 16
 ```
 
-The broad local pipeline is retained as an explicitly opt-in legacy workflow.
-It starts source-local Postgres and may download, parse, OCR, and tag artifacts:
+### Legacy local pipeline (parked)
+
+**Parked (2026-10-25):** the legacy tdnet-postgres database this pipeline
+writes to is retired. TDnet disclosure history now lives in the research
+database's `raw_tdnet_history` (see `docs/runbooks/tdnet-history.md` in the
+hedge-fund-takedo repo). Every command below, and `scripts/tdnet_all_in_one.sh
+--legacy-local` itself, now refuses to run and prints that message instead of
+starting Postgres/scraping/downloading/parsing. Document download/parse will
+move to the research DB under Root issue #50; until then the code is kept,
+not deleted. Set `TDNET_LEGACY_LOCAL_ENABLED=1` to re-enable the Python-side
+guard (`tdnet/database.py`) deliberately -- the shell script's own refusal in
+`scripts/tdnet_all_in_one.sh` still needs its matching early-exit block
+removed by hand, since that opt-in is intentionally not wired to the same
+environment variable.
+
+The broad local pipeline was an explicitly opt-in legacy workflow. It started
+source-local Postgres and could download, parse, OCR, and tag artifacts:
 
 ```bash
 scripts/tdnet_all_in_one.sh --legacy-local
@@ -402,9 +428,10 @@ Reports are written under `parse-reviews/<timestamp>/index.html`, with PNG page
 renders in the report's `assets/` directory. The `suspicious` strategy ranks
 documents using lightweight quality hints such as low text volume, sparse
 multi-page output, missing page JSON, and large PDFs with little extracted text.
-The generated report remains useful for offline QA snapshots; durable decisions
-should be saved through the review workbench so they persist in
-`document_parse_reviews` and can be filtered later.
+The generated report remains useful for offline QA snapshots. Saving durable
+decisions through the review workbench so they persist in
+`document_parse_reviews` is parked along with the rest of `app/backend` (see
+"Review web app (parked)" above).
 
 `review-parse` reads the research DB's migrated TDnet history
 (`raw_tdnet_history.parse_job`/`file`/`disclosure`/`parse_text`) as

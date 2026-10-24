@@ -15,15 +15,21 @@ from app.backend.routers.search import router as search_router
 from app.backend.schemas import HealthResponse
 from app.backend.search_setup import ensure_postgres_search_support
 from tdnet.config import get_settings
-from tdnet.database import engine, get_session, init_db
+from tdnet.database import get_engine, get_session, init_db, require_legacy_local_enabled
 
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # app/backend is the legacy tdnet-postgres review workbench (search,
+    # parser-quality, pipeline-run history, manual review decisions, page
+    # images) -- parked 2026-10-25 alongside the rest of the --legacy-local
+    # pipeline, see tdnet/database.py. Fails fast here, before any legacy DB
+    # access, unless TDNET_LEGACY_LOCAL_ENABLED re-enables it deliberately.
+    require_legacy_local_enabled()
     await init_db()
-    await ensure_postgres_search_support(engine)
+    await ensure_postgres_search_support(get_engine())
     yield
 
 

@@ -3,10 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ "${1:-}" != "--legacy-local" ]]; then
-  printf '%s\n' 'This legacy OCR pipeline requires --legacy-local as its first argument.' >&2
-  exit 2
-fi
-shift
-
+# PARKED (2026-10-25): this wraps tdnet_all_in_one.sh --legacy-local, which
+# now always refuses to run (see the matching comment and message there, and
+# tdnet/database.py for the Python-side guard). Delegate so the one retire
+# message stays in one place.
 exec "${SCRIPT_DIR}/tdnet_all_in_one.sh" --legacy-local --with-ocr "$@"
