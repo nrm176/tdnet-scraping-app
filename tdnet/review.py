@@ -1,31 +1,21 @@
 """Static visual review reports for parsed TDnet PDFs.
 
-Reads `analysis.tdnet_disclosure_history_v1` / `tdnet_parse_text_history_v1`
-(SQL044) as `research_reader`, instead of the legacy `tdnet` DB's ORM tables
-(Root spec 2026-10-24, research DB migration slice 7, §3.4 phase B). This
-module never opens a connection to the legacy DB; PDF page images are still
-rendered from the SSD path the disclosure-history view carries
-(`pdf_path`) -- that's a filesystem read, not a DB one, and is unchanged.
+Reads `raw_tdnet_history.parse_job`/`file`/`disclosure`/`parse_text` as
+`research_reader`, instead of the legacy `tdnet` DB's ORM tables (Root spec
+2026-10-24, research DB migration slice 7, §3.4 phase B). This module never
+opens a connection to the legacy DB; PDF page images are still rendered from
+the SSD path the `file` table carries (`storage_path`) -- that's a
+filesystem read, not a DB one, and is unchanged.
 
-Two known degradations from the legacy ORM version, both because SQL044's
-views don't carry the data (see `tdnet/history_queries.py`'s module
-docstring for the full list):
-
-- No `pages_json` per-page breakdown. `tdnet_parse_text_history_v1` only
-  carries the concatenated `content_text` plus its aggregate `page_count`/
-  `char_count`, so each candidate gets exactly one synthetic `ParsedPage`
-  holding the whole text, rather than the true per-page markdown. This
-  coarsens (but doesn't remove) `score_pages`' per-page heuristics, and
-  means `pages_per_file` no longer selects distinct real pages -- there's
-  only ever the one.
-- No `file_size_bytes`. The "large PDF with sparse extracted text" check in
-  `score_pages` is passed `file_size_bytes=None` and never fires.
-
-A candidate's `disclosure_id` (the stable hash id, not a legacy integer)
-replaces the old numeric `file_id`/`parse_job_id` as its HTML badge and as
-the key used to keep rendered page images distinct between candidates --
-numeric file/parse-job ids no longer exist once a disclosure is read from
-the research views.
+`research_reader` has `SELECT` on every `raw_tdnet_history` table (not just
+the SQL044 views), including `parse_text.pages_json` and `file.file_size_bytes`
+-- both missing from the views -- so candidate reconstruction (per-page
+markdown via `_pages_from_json`, the real `file_size_bytes` for
+`score_pages`' "large PDF, sparse text" check) is the same as the legacy ORM
+version, not a degraded approximation. `file.legacy_id`/`parse_job.legacy_id`
+map 1:1 to the legacy integer `disclosure_files.id`/`document_parse_jobs.id`,
+so `ParseReviewCandidate.file_id`/`.parse_job_id` and the HTML's badges are
+unchanged too.
 """
 from __future__ import annotations
 
@@ -59,14 +49,18 @@ class ParsedPage:
 
 @dataclass(frozen=True)
 class ParseReviewCandidate:
+    parse_job_id: int
+    file_id: int
     disclosure_id: str
     code: str
     company_name: str
     title: str
     disclosure_date: str
     pdf_path: Path
+    text_path: Path
     parser_name: str
     parser_version: str
+    file_size_bytes: int | None
     pages: list[ParsedPage]
     warnings: tuple[str, ...]
     suspicion_score: int
@@ -150,22 +144,51 @@ def score_pages(
     return score, tuple(warnings or ("looks normal",))
 
 
+def _pages_from_json(pages_json: dict | None) -> list[ParsedPage]:
+    """Mirror the pre-cutover `_load_pages`, which read a sidecar
+    `<parser>.<version>.pages.json` file from disk: same per-page
+    `markdown`/`char_count`/`page` fallback rules, applied to the identical
+    JSON `parse_text.pages_json` now carries verbatim (`parse_texts.py`'s
+    `load_parse_text_payload` wrote that column from that same file,
+    unchanged, when the row was first created -- so this is the same bytes,
+    not a different shape). A parser whose own `.pages.json` has no
+    `markdown`/`char_count` key (e.g. apple-vision-ocr's line-box format)
+    produced an empty page here before this cutover too; that is unchanged.
+    """
+    if not pages_json:
+        return []
+    pages: list[ParsedPage] = []
+    for index, page in enumerate(pages_json.get("pages", []), 1):
+        if not isinstance(page, dict):
+            continue
+        markdown = str(page.get("markdown") or "")
+        page_number = page.get("page")
+        pages.append(
+            ParsedPage(
+                page=page_number if isinstance(page_number, int) else index,
+                markdown=markdown,
+                char_count=int(page.get("char_count") or len(markdown)),
+            )
+        )
+    return pages
+
+
 def _candidate_from_row(row: dict) -> ParseReviewCandidate:
-    content_text = row["content_text"] or ""
-    char_count = row["char_count"] if row["char_count"] is not None else len(content_text)
-    # See module docstring: tdnet_parse_text_history_v1 has no pages_json, so
-    # one synthetic page stands in for the real per-page breakdown.
-    pages = [ParsedPage(page=1, markdown=content_text, char_count=char_count)]
-    score, warnings = score_pages(pages, file_size_bytes=None)
+    pages = _pages_from_json(row["pages_json"])
+    score, warnings = score_pages(pages, file_size_bytes=row["file_size_bytes"])
     return ParseReviewCandidate(
+        parse_job_id=row["parse_job_id"],
+        file_id=row["file_id"],
         disclosure_id=row["disclosure_id"],
         code=row["code"],
         company_name=row["name"],
         title=row["title"],
         disclosure_date=str(row["disclosure_date"]),
         pdf_path=Path(row["pdf_path"]) if row["pdf_path"] else Path(),
+        text_path=Path(row["text_path"]) if row["text_path"] else Path(),
         parser_name=row["parser_name"],
         parser_version=row["parser_version"],
+        file_size_bytes=row["file_size_bytes"],
         pages=pages,
         warnings=warnings,
         suspicion_score=score,
@@ -248,18 +271,18 @@ async def build_parse_review_report(
     assets_dir = output_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    image_map: dict[tuple[str, int], Path] = {}
+    image_map: dict[tuple[int, int], Path] = {}
     for candidate in candidates:
         selected_pages = candidate.pages[: max(1, pages_per_file)] or [ParsedPage(page=1, markdown="", char_count=0)]
         for page in selected_pages:
-            image_path = assets_dir / f"disclosure-{candidate.disclosure_id}-page-{page.page:03d}.png"
+            image_path = assets_dir / f"file-{candidate.file_id}-page-{page.page:03d}.png"
             try:
                 render_pdf_page(candidate.pdf_path, page.page, image_path)
-                image_map[(candidate.disclosure_id, page.page)] = image_path.relative_to(output_dir)
+                image_map[(candidate.file_id, page.page)] = image_path.relative_to(output_dir)
             except Exception as exc:
                 logger.warning(
-                    "Failed to render review image disclosure_id=%s page=%s error=%s",
-                    candidate.disclosure_id,
+                    "Failed to render review image file_id=%s page=%s error=%s",
+                    candidate.file_id,
                     page.page,
                     exc,
                 )
@@ -282,7 +305,7 @@ async def build_parse_review_report(
 def _render_report_html(
     candidates: list[ParseReviewCandidate],
     *,
-    image_map: dict[tuple[str, int], Path],
+    image_map: dict[tuple[int, int], Path],
     pages_per_file: int,
     strategy: str,
 ) -> str:
@@ -432,11 +455,12 @@ def _render_report_html(
 def _render_candidate(
     candidate: ParseReviewCandidate,
     *,
-    image_map: dict[tuple[str, int], Path],
+    image_map: dict[tuple[int, int], Path],
     pages_per_file: int,
 ) -> str:
     badges = [
-        f'<span class="badge">disclosure {html.escape(candidate.disclosure_id)}</span>',
+        f'<span class="badge">file {candidate.file_id}</span>',
+        f'<span class="badge">parse {candidate.parse_job_id}</span>',
         f'<span class="badge">score {candidate.suspicion_score}</span>',
         f'<span class="badge">{len(candidate.pages)} page(s)</span>',
     ]
@@ -468,9 +492,9 @@ def _render_page_row(
     candidate: ParseReviewCandidate,
     page: ParsedPage,
     *,
-    image_map: dict[tuple[str, int], Path],
+    image_map: dict[tuple[int, int], Path],
 ) -> str:
-    image_path = image_map.get((candidate.disclosure_id, page.page))
+    image_path = image_map.get((candidate.file_id, page.page))
     image_html = (
         f'<img src="{html.escape(str(image_path))}" alt="PDF page {page.page}">'
         if image_path

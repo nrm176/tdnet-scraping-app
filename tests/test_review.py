@@ -1,7 +1,7 @@
-"""`tdnet/review.py` reads analysis.tdnet_disclosure_history_v1 /
-tdnet_parse_text_history_v1 as research_reader (Root spec 2026-10-24,
-research DB migration slice 7, §3.4 phase B) -- these tests exercise it with
-a fake research engine/connection (the slice-2 Conn/Engine fake pattern in
+"""`tdnet/review.py` reads raw_tdnet_history.parse_job/file/disclosure/
+parse_text as research_reader (Root spec 2026-10-24, research DB migration
+slice 7, §3.4 phase B) -- these tests exercise it with a fake research
+engine/connection (the slice-2 Conn/Engine fake pattern in
 portfolio-manager's backend/tests/test_research_market_repository.py),
 never a live or legacy database. `score_pages` itself is DB-independent and
 unchanged by the cutover; its tests are unchanged too."""
@@ -116,19 +116,23 @@ async def test_build_parse_review_report(tmp_path, monkeypatch):
     text = "業績予想の修正に関するお知らせ\n" \
            "今回修正予想 18,000 2,580\n"
     row = {
+        "parse_job_id": 10,
+        "file_id": 1,
         "disclosure_id": "abc123def4567890",
         "code": "12345",
         "name": "テスト株式会社",
         "title": "業績予想の修正に関するお知らせ",
         "disclosure_date": date(2026, 5, 16),
         "pdf_path": str(pdf_path),
+        "file_size_bytes": 10,
+        "text_path": str(tmp_path / "parsed.md"),
         "parser_name": "pymupdf4llm",
         "parser_version": "test-version",
-        "content_text": text,
-        "page_count": 1,
-        "char_count": len(text),
+        # raw_tdnet_history.parse_text.pages_json carries the legacy
+        # per-page markdown structure verbatim (see _pages_from_json).
+        "pages_json": {"pages": [{"page": 1, "markdown": text, "char_count": len(text)}]},
     }
-    conn = Conn([(history_queries.PARSE_TEXT_VIEW, Result(rows=[row]))])
+    conn = Conn([(history_queries.RAW_PARSE_JOB, Result(rows=[row]))])
 
     def fake_render(pdf_path: Path, page_number: int, destination: Path, *, zoom: float = 1.5) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -147,27 +151,30 @@ async def test_build_parse_review_report(tmp_path, monkeypatch):
     assert report.reviewed_count == 1
     assert "TDnet Parse Review" in html
     assert "業績予想の修正に関するお知らせ" in html
-    assert "disclosure abc123def4567890" in html
-    assert "file " not in html  # old numeric file-id badge is gone
-    assert list((report.output_dir / "assets").glob("*.png"))
+    # legacy_id-derived file/parse-job badges, matching the pre-cutover HTML.
+    assert "file 1" in html
+    assert "parse 10" in html
+    assert list((report.output_dir / "assets").glob("file-1-page-001.png"))
 
 
 @pytest.mark.asyncio
 async def test_build_parse_review_report_handles_missing_pdf_path_gracefully(tmp_path):
     row = {
+        "parse_job_id": 11,
+        "file_id": 2,
         "disclosure_id": "noPdfPath00000001",
         "code": "99999",
         "name": "No PDF Co",
         "title": "Some disclosure",
         "disclosure_date": date(2026, 5, 16),
         "pdf_path": None,
+        "file_size_bytes": None,
+        "text_path": None,
         "parser_name": "pymupdf4llm",
         "parser_version": "test-version",
-        "content_text": "short",
-        "page_count": 1,
-        "char_count": 5,
+        "pages_json": None,
     }
-    conn = Conn([(history_queries.PARSE_TEXT_VIEW, Result(rows=[row]))])
+    conn = Conn([(history_queries.RAW_PARSE_JOB, Result(rows=[row]))])
 
     report = await build_parse_review_report(
         output_root=tmp_path / "reviews",
@@ -179,3 +186,5 @@ async def test_build_parse_review_report_handles_missing_pdf_path_gracefully(tmp
     assert report.reviewed_count == 1
     html = report.index_path.read_text(encoding="utf-8")
     assert "PDF page image was not available." in html
+    # No pages_json at all -> score_pages' empty-pages fallback.
+    assert "missing page JSON" in html

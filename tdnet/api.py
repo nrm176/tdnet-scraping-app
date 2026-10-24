@@ -1,16 +1,15 @@
 """FastAPI application for persisted TDnet disclosures.
 
-Reads `analysis.tdnet_disclosure_history_v1` / `tdnet_parse_text_history_v1`
-/ `tdnet_report_tag_history_v1` (SQL044) as `research_reader`, instead of the
-legacy `tdnet` DB's ORM tables (Root spec 2026-10-24, research DB migration
-slice 7, §3.4 phase B). This app never opens a connection to the legacy DB.
-
-Response shapes are unchanged from before the cutover. Where a view doesn't
-carry data a field used to come from, that field is populated with an empty
-list, `None`, zero, or a documented default -- never by falling back to a
-legacy read. `tdnet/history_queries.py`'s module docstring is the one place
-that spells out exactly what each view does and doesn't carry; the comments
-below say which gap applies at each call site.
+Reads the research DB's migrated TDnet history (`raw_tdnet_history.*` and
+the SQL044 `analysis.tdnet_disclosure_history_v1` view) as `research_reader`,
+instead of the legacy `tdnet` DB's ORM tables (Root spec 2026-10-24, research
+DB migration slice 7, §3.4 phase B). This app never opens a connection to
+the legacy DB. `research_reader` has `SELECT` on every `raw_tdnet_history`
+table, so every endpoint here returns the same data it did against legacy --
+see `tdnet/history_queries.py`'s module docstring for exactly which table
+backs which field. The one legacy table that was never migrated,
+`document_parse_reviews`, was already empty (ruling T2), so there is nothing
+to lose there either.
 """
 from __future__ import annotations
 
@@ -236,15 +235,123 @@ def _tag_assignment_from_row(row: dict) -> ReportTagAssignmentLineageResponse:
         is_primary=row["is_primary"],
         confidence=row["confidence"],
         source=row["source"],
-        # analysis.tdnet_report_tag_history_v1 carries no per-assignment
-        # file/parse-job linkage or evidence_json (history_queries.py's
-        # module docstring) -- null rather than a legacy read.
-        file_id=None,
-        parse_job_id=None,
-        evidence_json=None,
+        file_id=row["file_id"],
+        parse_job_id=row["parse_job_id"],
+        evidence_json=row["evidence_json"],
         tagger_name=row["tagger_name"],
         tagger_version=row["tagger_version"],
     )
+
+
+def _file_response_from_row(row: dict) -> DisclosureFileResponse:
+    return DisclosureFileResponse(
+        id=row["id"],
+        disclosure_id=row["disclosure_id"],
+        file_type=row["file_type"],
+        source_url=row["source_url"],
+        source_file_id=row["source_file_id"],
+        storage_bucket=row["storage_bucket"],
+        storage_path=row["storage_path"],
+        content_type=row["content_type"],
+        file_size_bytes=row["file_size_bytes"],
+        sha256=row["sha256"],
+        download_status=row["download_status"],
+        download_attempts=row["download_attempts"],
+        downloaded_at=row["downloaded_at"],
+        last_download_error=row["last_download_error"],
+    )
+
+
+def _parse_text_summary_from_row(row: dict) -> ParseTextSummaryResponse | None:
+    if row["text_id"] is None:
+        return None
+    return ParseTextSummaryResponse(
+        id=row["text_id"],
+        parse_job_id=row["id"],
+        page_count=row["text_page_count"],
+        char_count=row["text_char_count"],
+        content_sha256=row["text_content_sha256"],
+        created_at=row["text_created_at"],
+        updated_at=row["text_updated_at"],
+    )
+
+
+def _parse_job_from_row(row: dict) -> ParseJobLineageResponse:
+    return ParseJobLineageResponse(
+        id=row["id"],
+        file_id=row["file_id"],
+        parser_name=row["parser_name"],
+        parser_version=row["parser_version"],
+        parse_status=row["parse_status"],
+        parse_attempts=row["parse_attempts"],
+        text_path=row["text_path"],
+        text_sha256=row["text_sha256"],
+        parsed_at=row["parsed_at"],
+        last_parse_error=row["last_parse_error"],
+        parse_text=_parse_text_summary_from_row(row),
+    )
+
+
+def _analysis_result_from_row(row: dict) -> AnalysisResultResponse:
+    return AnalysisResultResponse(
+        id=row["id"],
+        file_id=row["file_id"],
+        parse_job_id=row["parse_job_id"],
+        analysis_type=row["analysis_type"],
+        analyzer_name=row["analyzer_name"],
+        analyzer_version=row["analyzer_version"],
+        status=row["status"],
+        result_json=row["result_json"],
+        result_text=row["result_text"],
+        analyzed_at=row["analyzed_at"],
+        last_analysis_error=row["last_analysis_error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+async def _load_lineage(conn: AsyncConnection, disclosure_rows: list[dict]) -> dict[str, DisclosureLineageResponse]:
+    """Mirror the legacy ORM's `_load_lineage`: one query per table, batched
+    across every disclosure in `disclosure_rows`, then assembled in Python --
+    just reading `raw_tdnet_history.*` instead of the ORM session."""
+    if not disclosure_rows:
+        return {}
+
+    disclosure_ids = [row["disclosure_id"] for row in disclosure_rows]
+    file_rows = await history_queries.fetch_files_for_disclosures(conn, disclosure_ids)
+    file_legacy_ids = [row["id"] for row in file_rows]
+
+    parse_jobs_by_file: dict[int, list[ParseJobLineageResponse]] = defaultdict(list)
+    analysis_results_by_file: dict[int, list[AnalysisResultResponse]] = defaultdict(list)
+    if file_legacy_ids:
+        for parse_job_row in await history_queries.fetch_parse_jobs_for_files(conn, file_legacy_ids):
+            parse_jobs_by_file[parse_job_row["file_id"]].append(_parse_job_from_row(parse_job_row))
+        for analysis_row in await history_queries.fetch_analysis_results_for_files(conn, file_legacy_ids):
+            analysis_results_by_file[analysis_row["file_id"]].append(_analysis_result_from_row(analysis_row))
+
+    files_by_disclosure: dict[str, list[DisclosureFileLineageResponse]] = defaultdict(list)
+    for file_row in file_rows:
+        files_by_disclosure[file_row["disclosure_id"]].append(
+            DisclosureFileLineageResponse(
+                **_file_response_from_row(file_row).model_dump(),
+                parse_jobs=parse_jobs_by_file[file_row["id"]],
+                analysis_results=analysis_results_by_file[file_row["id"]],
+            )
+        )
+
+    tag_rows = await history_queries.fetch_tags_for_disclosures(conn, disclosure_ids)
+    tags_by_disclosure: dict[str, list[ReportTagAssignmentLineageResponse]] = defaultdict(list)
+    for tag_row in tag_rows:
+        tags_by_disclosure[tag_row["disclosure_id"]].append(_tag_assignment_from_row(tag_row))
+
+    return {
+        disclosure_row["disclosure_id"]: DisclosureLineageResponse(
+            disclosure=_disclosure_from_row(disclosure_row),
+            tags=tags_by_disclosure[disclosure_row["disclosure_id"]],
+            files=files_by_disclosure[disclosure_row["disclosure_id"]],
+        )
+        for disclosure_row in disclosure_rows
+    }
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -306,15 +413,8 @@ async def read_disclosure_lineage(
     row = await history_queries.fetch_disclosure(conn, disclosure_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Disclosure not found")
-    tag_rows = await history_queries.fetch_tags_for_disclosures(conn, [disclosure_id])
-    return DisclosureLineageResponse(
-        disclosure=_disclosure_from_row(row),
-        tags=[_tag_assignment_from_row(tag_row) for tag_row in tag_rows],
-        # No per-file identity/download/parse-job status survives into the
-        # history views (history_queries.py's module docstring), so file
-        # lineage can't be rebuilt; empty rather than a legacy read.
-        files=[],
-    )
+    lineage = await _load_lineage(conn, [row])
+    return lineage[disclosure_id]
 
 
 @app.get("/disclosures/{disclosure_id}/parser-status", response_model=ParserStatusResponse)
@@ -325,23 +425,39 @@ async def read_disclosure_parser_status(
     row = await history_queries.fetch_disclosure(conn, disclosure_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Disclosure not found")
-    # Same files=[] limitation as /lineage above.
-    return ParserStatusResponse(disclosure_id=disclosure_id, files=[])
+    lineage = await _load_lineage(conn, [row])
+    return ParserStatusResponse(disclosure_id=disclosure_id, files=lineage[disclosure_id].files)
 
 
 @app.get("/disclosure-files", response_model=DisclosureFileListResponse)
 async def list_disclosure_files(
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
     download_status: str | None = None,
     file_type: str | None = None,
     disclosure_id: str | None = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DisclosureFileListResponse:
-    # No view exposes per-file identity or download metadata at all
-    # (history_queries.py's module docstring) -- this endpoint can no longer
-    # be served from the research reader, so it always returns empty rather
-    # than reading the legacy DB.
-    return DisclosureFileListResponse(total=0, limit=limit, offset=offset, files=[])
+    total = await history_queries.count_disclosure_files(
+        conn,
+        disclosure_id=disclosure_id,
+        download_status=download_status,
+        file_type=file_type,
+    )
+    rows = await history_queries.fetch_disclosure_files(
+        conn,
+        disclosure_id=disclosure_id,
+        download_status=download_status,
+        file_type=file_type,
+        limit=limit,
+        offset=offset,
+    )
+    return DisclosureFileListResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        files=[_file_response_from_row(row) for row in rows],
+    )
 
 
 @app.get("/companies/{code}/disclosures", response_model=DisclosureListResponse)
@@ -399,39 +515,26 @@ async def read_company_timeline(
         limit=limit,
         offset=offset,
     )
-    disclosure_ids = [row["disclosure_id"] for row in rows]
-    tag_rows = await history_queries.fetch_tags_for_disclosures(conn, disclosure_ids)
-    tags_by_disclosure: dict[str, list[ReportTagAssignmentLineageResponse]] = defaultdict(list)
-    for tag_row in tag_rows:
-        tags_by_disclosure[tag_row["disclosure_id"]].append(_tag_assignment_from_row(tag_row))
+    lineage_by_disclosure = await _load_lineage(conn, rows)
 
     timeline_items: list[CompanyTimelineDisclosureResponse] = []
     for row in rows:
-        has_pdf = row["pdf_path"] is not None
-        has_xbrl = bool(row["has_xbrl_file"])
-        has_parse_text = bool(row["has_parse_text"])
-        pdf_completed = row["pdf_sha256"] is not None
-        # No view exposes per-file/per-parse-job identity (history_queries.py's
-        # module docstring); these counts are derived from the
-        # existence/completion booleans the disclosure-history view does
-        # carry, rather than from a legacy read. has_xbrl_file is an EXISTS
-        # check (not a download-success check -- the view has no xbrl
-        # sha256), so the xbrl file is counted as "completed" once it exists.
-        file_count = (1 if has_pdf else 0) + (1 if has_xbrl else 0)
-        completed_file_count = (1 if pdf_completed else 0) + (1 if has_xbrl else 0)
-        parse_job_count = 1 if has_parse_text else 0
-        completed_parse_job_count = parse_job_count
+        lineage = lineage_by_disclosure[row["disclosure_id"]]
+        parse_job_count = sum(len(file.parse_jobs) for file in lineage.files)
+        completed_parse_job_count = sum(
+            1 for file in lineage.files for parse_job in file.parse_jobs if parse_job.parse_status == "completed"
+        )
+        analysis_result_count = sum(len(file.analysis_results) for file in lineage.files)
         timeline_items.append(
             CompanyTimelineDisclosureResponse(
-                disclosure=_disclosure_from_row(row),
-                tags=tags_by_disclosure[row["disclosure_id"]],
-                file_count=file_count,
-                completed_file_count=completed_file_count,
+                disclosure=lineage.disclosure,
+                tags=lineage.tags,
+                file_count=len(lineage.files),
+                completed_file_count=sum(1 for file in lineage.files if file.download_status == "completed"),
                 parse_job_count=parse_job_count,
                 completed_parse_job_count=completed_parse_job_count,
-                # document_analysis_result has no SQL044 view at all.
-                analysis_result_count=0,
-                files=[],
+                analysis_result_count=analysis_result_count,
+                files=lineage.files,
             )
         )
     return CompanyTimelineResponse(
@@ -448,32 +551,29 @@ async def read_company_timeline(
 async def read_parser_quality(
     conn: Annotated[AsyncConnection, Depends(get_research_connection)],
 ) -> ParserQualityResponse:
-    total = await history_queries.fetch_parser_totals(conn)
+    totals = await history_queries.fetch_parser_totals(conn)
+    status_rows = await history_queries.fetch_parser_status_counts(conn)
     breakdown = await history_queries.fetch_parser_breakdown(conn)
-    # document_parse_texts only ever held successfully parsed output, and no
-    # view exposes document_parse_jobs' status at all -- so "failed",
-    # "running" and "pending" are unobservable post-migration, and every
-    # count below is really just "completed" (history_queries.py's module
-    # docstring).
     return ParserQualityResponse(
-        total_jobs=total,
-        completed_jobs=total,
-        failed_jobs=0,
-        running_jobs=0,
-        pending_jobs=0,
-        parse_texts=total,
-        status_counts=(
-            [ParserQualityStatusCount(parse_status="completed", count=total)] if total else []
-        ),
+        total_jobs=totals["total_jobs"],
+        completed_jobs=totals["completed_jobs"],
+        failed_jobs=totals["failed_jobs"],
+        running_jobs=totals["running_jobs"],
+        pending_jobs=totals["pending_jobs"],
+        parse_texts=totals["parse_texts"],
+        status_counts=[
+            ParserQualityStatusCount(parse_status=row["parse_status"], count=row["count"])
+            for row in status_rows
+        ],
         parsers=[
             ParserQualityParserResponse(
                 parser_name=row["parser_name"],
                 parser_version=row["parser_version"],
-                total_jobs=row["parse_texts"],
-                completed_jobs=row["parse_texts"],
-                failed_jobs=0,
-                running_jobs=0,
-                pending_jobs=0,
+                total_jobs=row["total_jobs"],
+                completed_jobs=row["completed_jobs"],
+                failed_jobs=row["failed_jobs"],
+                running_jobs=row["running_jobs"],
+                pending_jobs=row["pending_jobs"],
                 parse_texts=row["parse_texts"],
                 average_char_count=(
                     float(row["average_char_count"]) if row["average_char_count"] is not None else None
@@ -497,13 +597,7 @@ async def read_tag_summaries(
                 label_en=row["label_en"],
                 description=row["description"],
                 priority=row["priority"],
-                # analysis.tdnet_report_tag_history_v1 carries no
-                # report_tag.active; every migrated tag was active as of the
-                # 2026-09-05 freeze, so True stands in for a legacy read.
-                # Note: this view is assignments joined to tags, so a tag
-                # with zero assignments (none, as far as the 2026-10-24
-                # survey found) would not appear here at all.
-                active=True,
+                active=row["active"],
                 assignment_count=row["assignment_count"],
                 primary_count=row["primary_count"],
             )

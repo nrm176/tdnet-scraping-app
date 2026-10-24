@@ -40,13 +40,18 @@ feature backlog and linked GitHub issues.
 
 ## API usage
 
-`tdnet/api.py` reads the research DB's migrated TDnet history views
-(`analysis.tdnet_disclosure_history_v1` / `tdnet_parse_text_history_v1` /
-`tdnet_report_tag_history_v1`, SQL044) as `research_reader`, not the legacy
-local Postgres `DATABASE_URL` connects to -- the legacy DB is no longer read
-anywhere in this app (Root spec 2026-10-24, research DB migration slice 7,
-§3.4 phase B). Set `RESEARCH_DATABASE_URL`, or leave it unset to build the
-reader URL in memory from Root's session file; see `.env.example`.
+`tdnet/api.py` reads the research DB's migrated TDnet history as
+`research_reader` -- the SQL044 `analysis.tdnet_disclosure_history_v1` view
+for plain disclosure listing/lookup, and `raw_tdnet_history.*` directly for
+everything with per-file/per-parse-job/analysis-result detail -- not the
+legacy local Postgres `DATABASE_URL` connects to; the legacy DB is no longer
+read anywhere in this app (Root spec 2026-10-24, research DB migration
+slice 7, §3.4 phase B). `research_reader` has `SELECT` on every
+`raw_tdnet_history` table, so every endpoint returns the same data it did
+against legacy; see `tdnet/history_queries.py`'s module docstring for which
+table backs which field. Set `RESEARCH_DATABASE_URL`, or leave it unset to
+build the reader URL in memory from Root's session file; see
+`.env.example`.
 
 Start the FastAPI app:
 
@@ -75,16 +80,13 @@ PostgreSQL, download source files, and parse completed PDF downloads. The
 lineage and summary endpoints connect disclosures to downloaded files, parser
 jobs, persisted parse text, deterministic tags, and downstream analysis results.
 
-Since the SQL044 views don't carry per-file identity, per-parse-job status,
-or analysis results (only a pdf's hash/path, two existence booleans for the
-pdf/xbrl files, and the parsed text itself), several endpoints degrade
-rather than reading legacy: `/disclosure-files` always returns an empty
-list; `/disclosures/{id}/lineage`, `/disclosures/{id}/parser-status`, and
-`/companies/{code}/timeline` always return `files: []`; `/parser-quality`
-only ever shows the `completed` status bucket (failed/running/pending parse
-jobs were never migrated into a reader-exposed view); and `/tags` defaults
-`active` to `true` and only lists tags with at least one assignment. See
-`tdnet/history_queries.py`'s module docstring for the complete list.
+The one legacy table that was never migrated into the research DB,
+`document_parse_reviews`, was already empty at the 2026-09-05 freeze (no
+review workbench decisions had been saved), so there is nothing to lose
+there either -- every other field in every endpoint comes from
+`raw_tdnet_history.*` or the SQL044 view, reproduced exactly (legacy integer
+`id`/`file_id`/`parse_job_id` values are the raw tables' `legacy_id`/
+`file_legacy_id`/`parse_job_legacy_id` columns).
 
 ## Review web app
 
@@ -404,13 +406,15 @@ The generated report remains useful for offline QA snapshots; durable decisions
 should be saved through the review workbench so they persist in
 `document_parse_reviews` and can be filtered later.
 
-`review-parse` reads the research DB's migrated TDnet history views as
+`review-parse` reads the research DB's migrated TDnet history
+(`raw_tdnet_history.parse_job`/`file`/`disclosure`/`parse_text`) as
 `research_reader`, the same as `tdnet/api.py` above -- it does not touch the
 legacy local Postgres this CLI's scrape/download/parse commands write to. A
 report generated right after a `--legacy-local` run only shows disclosures
 already migrated into the research DB, not ones that just landed locally.
-It also only has the concatenated parsed text (no per-page breakdown and no
-file size), so each document renders as a single synthetic page.
+Everything else is unchanged: real per-page markdown (from
+`parse_text.pages_json`), the real file size for the "large PDF, sparse
+text" heuristic, and the same `file`/`parse` id badges.
 
 ## CI and distribution
 
