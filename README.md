@@ -40,6 +40,14 @@ feature backlog and linked GitHub issues.
 
 ## API usage
 
+`tdnet/api.py` reads the research DB's migrated TDnet history views
+(`analysis.tdnet_disclosure_history_v1` / `tdnet_parse_text_history_v1` /
+`tdnet_report_tag_history_v1`, SQL044) as `research_reader`, not the legacy
+local Postgres `DATABASE_URL` connects to -- the legacy DB is no longer read
+anywhere in this app (Root spec 2026-10-24, research DB migration slice 7,
+§3.4 phase B). Set `RESEARCH_DATABASE_URL`, or leave it unset to build the
+reader URL in memory from Root's session file; see `.env.example`.
+
 Start the FastAPI app:
 
 ```bash
@@ -66,6 +74,17 @@ The API has no auth in v1 and is read-only. Use the CLI to ingest data into
 PostgreSQL, download source files, and parse completed PDF downloads. The
 lineage and summary endpoints connect disclosures to downloaded files, parser
 jobs, persisted parse text, deterministic tags, and downstream analysis results.
+
+Since the SQL044 views don't carry per-file identity, per-parse-job status,
+or analysis results (only a pdf's hash/path, two existence booleans for the
+pdf/xbrl files, and the parsed text itself), several endpoints degrade
+rather than reading legacy: `/disclosure-files` always returns an empty
+list; `/disclosures/{id}/lineage`, `/disclosures/{id}/parser-status`, and
+`/companies/{code}/timeline` always return `files: []`; `/parser-quality`
+only ever shows the `completed` status bucket (failed/running/pending parse
+jobs were never migrated into a reader-exposed view); and `/tags` defaults
+`active` to `true` and only lists tags with at least one assignment. See
+`tdnet/history_queries.py`'s module docstring for the complete list.
 
 ## Review web app
 
@@ -384,6 +403,14 @@ multi-page output, missing page JSON, and large PDFs with little extracted text.
 The generated report remains useful for offline QA snapshots; durable decisions
 should be saved through the review workbench so they persist in
 `document_parse_reviews` and can be filtered later.
+
+`review-parse` reads the research DB's migrated TDnet history views as
+`research_reader`, the same as `tdnet/api.py` above -- it does not touch the
+legacy local Postgres this CLI's scrape/download/parse commands write to. A
+report generated right after a `--legacy-local` run only shows disclosures
+already migrated into the research DB, not ones that just landed locally.
+It also only has the concatenated parsed text (no per-page breakdown and no
+file size), so each document renders as a single synthetic page.
 
 ## CI and distribution
 

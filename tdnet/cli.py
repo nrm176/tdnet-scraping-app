@@ -336,19 +336,24 @@ async def _parse_ixbrl_text(args: argparse.Namespace) -> int:
 
 
 async def _review_parses(args: argparse.Namespace) -> int:
-    await init_db()
+    # review-parse reads the research DB's migrated TDnet history views as
+    # research_reader (tdnet/research_reader.py), not the legacy local
+    # Postgres the rest of this CLI's commands write to -- so there is no
+    # init_db()/SessionLocal here any more. This means a report generated
+    # right after a --legacy-local scrape/parse run only shows disclosures
+    # already migrated into the research DB, not ones that landed in the
+    # local legacy DB moments ago (Root spec 2026-10-24, research DB
+    # migration slice 7, §3.4 phase B).
     parser_version = _resolve_parser_version(args.parser_name, args.parser_version)
-    async with SessionLocal() as session:
-        report = await build_parse_review_report(
-            session,
-            output_root=Path(args.output_root),
-            strategy=args.strategy,
-            limit=args.limit,
-            pages_per_file=args.pages_per_file,
-            parser_name=args.parser_name,
-            parser_version=parser_version,
-            open_report=args.open,
-        )
+    report = await build_parse_review_report(
+        output_root=Path(args.output_root),
+        strategy=args.strategy,
+        limit=args.limit,
+        pages_per_file=args.pages_per_file,
+        parser_name=args.parser_name,
+        parser_version=parser_version,
+        open_report=args.open,
+    )
     print(f"Review strategy: {report.strategy}")
     print(f"Reviewed documents: {report.reviewed_count}")
     print(f"Report: {report.index_path.resolve()}")

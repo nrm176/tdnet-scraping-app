@@ -1,21 +1,48 @@
-"""Static visual review reports for parsed TDnet PDFs."""
+"""Static visual review reports for parsed TDnet PDFs.
+
+Reads `analysis.tdnet_disclosure_history_v1` / `tdnet_parse_text_history_v1`
+(SQL044) as `research_reader`, instead of the legacy `tdnet` DB's ORM tables
+(Root spec 2026-10-24, research DB migration slice 7, §3.4 phase B). This
+module never opens a connection to the legacy DB; PDF page images are still
+rendered from the SSD path the disclosure-history view carries
+(`pdf_path`) -- that's a filesystem read, not a DB one, and is unchanged.
+
+Two known degradations from the legacy ORM version, both because SQL044's
+views don't carry the data (see `tdnet/history_queries.py`'s module
+docstring for the full list):
+
+- No `pages_json` per-page breakdown. `tdnet_parse_text_history_v1` only
+  carries the concatenated `content_text` plus its aggregate `page_count`/
+  `char_count`, so each candidate gets exactly one synthetic `ParsedPage`
+  holding the whole text, rather than the true per-page markdown. This
+  coarsens (but doesn't remove) `score_pages`' per-page heuristics, and
+  means `pages_per_file` no longer selects distinct real pages -- there's
+  only ever the one.
+- No `file_size_bytes`. The "large PDF with sparse extracted text" check in
+  `score_pages` is passed `file_size_bytes=None` and never fires.
+
+A candidate's `disclosure_id` (the stable hash id, not a legacy integer)
+replaces the old numeric `file_id`/`parse_job_id` as its HTML badge and as
+the key used to keep rendered page images distinct between candidates --
+numeric file/parse-job ids no longer exist once a disclosure is read from
+the research views.
+"""
 from __future__ import annotations
 
 import html
-import json
 import logging
 import random
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .orm import DisclosureFileRecord, DisclosureRecord, DocumentParseJobRecord
+from . import history_queries
 from .parsers import PARSER_NAME, get_parser_version
+from .research_reader import run_read
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +59,14 @@ class ParsedPage:
 
 @dataclass(frozen=True)
 class ParseReviewCandidate:
-    parse_job_id: int
-    file_id: int
     disclosure_id: str
     code: str
     company_name: str
     title: str
     disclosure_date: str
     pdf_path: Path
-    text_path: Path
     parser_name: str
     parser_version: str
-    file_size_bytes: int | None
     pages: list[ParsedPage]
     warnings: tuple[str, ...]
     suspicion_score: int
@@ -55,27 +78,6 @@ class ParseReviewReport:
     index_path: Path
     reviewed_count: int
     strategy: str
-
-
-def _load_pages(path: Path) -> list[ParsedPage]:
-    pages_path = path.with_name(path.name.replace(".md", ".pages.json"))
-    if not pages_path.exists():
-        return []
-    raw = json.loads(pages_path.read_text(encoding="utf-8"))
-    pages: list[ParsedPage] = []
-    for index, page in enumerate(raw.get("pages", []), 1):
-        if not isinstance(page, dict):
-            continue
-        markdown = str(page.get("markdown") or "")
-        page_number = page.get("page")
-        pages.append(
-            ParsedPage(
-                page=page_number if isinstance(page_number, int) else index,
-                markdown=markdown,
-                char_count=int(page.get("char_count") or len(markdown)),
-            )
-        )
-    return pages
 
 
 def _is_japanese_character(character: str) -> bool:
@@ -95,7 +97,7 @@ def _garbled_text_warnings(text: str) -> tuple[tuple[str, int], ...]:
     total_chars = len(text)
     japanese_chars = sum(1 for character in text if _is_japanese_character(character))
     control_chars = sum(1 for character in text if ord(character) < 32 and character not in _TEXT_WHITESPACE)
-    replacement_chars = text.count("\ufffd")
+    replacement_chars = text.count("�")
     latin1_symbol_chars = sum(1 for character in text if 0x80 <= ord(character) <= 0xFF)
     table_breaks = text.count("<br>")
 
@@ -148,66 +150,49 @@ def score_pages(
     return score, tuple(warnings or ("looks normal",))
 
 
+def _candidate_from_row(row: dict) -> ParseReviewCandidate:
+    content_text = row["content_text"] or ""
+    char_count = row["char_count"] if row["char_count"] is not None else len(content_text)
+    # See module docstring: tdnet_parse_text_history_v1 has no pages_json, so
+    # one synthetic page stands in for the real per-page breakdown.
+    pages = [ParsedPage(page=1, markdown=content_text, char_count=char_count)]
+    score, warnings = score_pages(pages, file_size_bytes=None)
+    return ParseReviewCandidate(
+        disclosure_id=row["disclosure_id"],
+        code=row["code"],
+        company_name=row["name"],
+        title=row["title"],
+        disclosure_date=str(row["disclosure_date"]),
+        pdf_path=Path(row["pdf_path"]) if row["pdf_path"] else Path(),
+        parser_name=row["parser_name"],
+        parser_version=row["parser_version"],
+        pages=pages,
+        warnings=warnings,
+        suspicion_score=score,
+    )
+
+
 async def select_review_candidates(
-    session: AsyncSession,
     *,
     strategy: ReviewStrategy = "suspicious",
     limit: int = 50,
     parser_name: str = PARSER_NAME,
     parser_version: str | None = None,
+    engine: Optional[AsyncEngine] = None,
 ) -> list[ParseReviewCandidate]:
     version = parser_version or get_parser_version()
-    stmt = (
-        select(DocumentParseJobRecord, DisclosureFileRecord, DisclosureRecord)
-        .join(DisclosureFileRecord, DocumentParseJobRecord.file_id == DisclosureFileRecord.id)
-        .join(DisclosureRecord, DisclosureFileRecord.disclosure_id == DisclosureRecord.id)
-        .where(DocumentParseJobRecord.parse_status == "completed")
-        .where(DocumentParseJobRecord.parser_name == parser_name)
-        .where(DocumentParseJobRecord.parser_version == version)
-        .where(DocumentParseJobRecord.text_path.is_not(None))
-    )
 
-    if strategy == "random":
-        stmt = stmt.order_by(func.random()).limit(limit)
-    elif strategy == "recent":
-        stmt = stmt.order_by(DocumentParseJobRecord.parsed_at.desc(), DocumentParseJobRecord.id.desc()).limit(limit)
-    elif strategy == "forecast-correction":
-        stmt = (
-            stmt.where(
-                (DisclosureRecord.title.contains("業績予想"))
-                | (DisclosureRecord.title.contains("予想値"))
-            )
-            .order_by(DocumentParseJobRecord.parsed_at.desc(), DocumentParseJobRecord.id.desc())
-            .limit(limit)
+    async def _do(conn):
+        return await history_queries.fetch_review_candidates(
+            conn,
+            strategy=strategy,
+            limit=limit,
+            parser_name=parser_name,
+            parser_version=version,
         )
-    else:
-        stmt = stmt.order_by(DocumentParseJobRecord.parsed_at.desc(), DocumentParseJobRecord.id.desc()).limit(limit * 20)
 
-    rows = (await session.execute(stmt)).all()
-    candidates: list[ParseReviewCandidate] = []
-    for parse_job, file_record, disclosure in rows:
-        text_path = Path(parse_job.text_path)
-        pages = _load_pages(text_path)
-        score, warnings = score_pages(pages, file_size_bytes=file_record.file_size_bytes)
-        candidates.append(
-            ParseReviewCandidate(
-                parse_job_id=parse_job.id,
-                file_id=file_record.id,
-                disclosure_id=disclosure.id,
-                code=disclosure.code,
-                company_name=disclosure.name,
-                title=disclosure.title,
-                disclosure_date=str(disclosure.disclosure_date),
-                pdf_path=Path(file_record.storage_path),
-                text_path=text_path,
-                parser_name=parse_job.parser_name,
-                parser_version=parse_job.parser_version,
-                file_size_bytes=file_record.file_size_bytes,
-                pages=pages,
-                warnings=warnings,
-                suspicion_score=score,
-            )
-        )
+    rows = await run_read(_do, engine=engine)
+    candidates = [_candidate_from_row(row) for row in rows]
 
     if strategy == "suspicious":
         candidates.sort(key=lambda candidate: candidate.suspicion_score, reverse=True)
@@ -241,7 +226,6 @@ def render_pdf_page(pdf_path: Path, page_number: int, destination: Path, *, zoom
 
 
 async def build_parse_review_report(
-    session: AsyncSession,
     *,
     output_root: Path = Path("parse-reviews"),
     strategy: ReviewStrategy = "suspicious",
@@ -250,31 +234,32 @@ async def build_parse_review_report(
     parser_name: str = PARSER_NAME,
     parser_version: str | None = None,
     open_report: bool = False,
+    engine: Optional[AsyncEngine] = None,
 ) -> ParseReviewReport:
     candidates = await select_review_candidates(
-        session,
         strategy=strategy,
         limit=limit,
         parser_name=parser_name,
         parser_version=parser_version,
+        engine=engine,
     )
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = output_root / stamp
     assets_dir = output_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    image_map: dict[tuple[int, int], Path] = {}
+    image_map: dict[tuple[str, int], Path] = {}
     for candidate in candidates:
         selected_pages = candidate.pages[: max(1, pages_per_file)] or [ParsedPage(page=1, markdown="", char_count=0)]
         for page in selected_pages:
-            image_path = assets_dir / f"file-{candidate.file_id}-page-{page.page:03d}.png"
+            image_path = assets_dir / f"disclosure-{candidate.disclosure_id}-page-{page.page:03d}.png"
             try:
                 render_pdf_page(candidate.pdf_path, page.page, image_path)
-                image_map[(candidate.file_id, page.page)] = image_path.relative_to(output_dir)
+                image_map[(candidate.disclosure_id, page.page)] = image_path.relative_to(output_dir)
             except Exception as exc:
                 logger.warning(
-                    "Failed to render review image file_id=%s page=%s error=%s",
-                    candidate.file_id,
+                    "Failed to render review image disclosure_id=%s page=%s error=%s",
+                    candidate.disclosure_id,
                     page.page,
                     exc,
                 )
@@ -297,7 +282,7 @@ async def build_parse_review_report(
 def _render_report_html(
     candidates: list[ParseReviewCandidate],
     *,
-    image_map: dict[tuple[int, int], Path],
+    image_map: dict[tuple[str, int], Path],
     pages_per_file: int,
     strategy: str,
 ) -> str:
@@ -447,12 +432,11 @@ def _render_report_html(
 def _render_candidate(
     candidate: ParseReviewCandidate,
     *,
-    image_map: dict[tuple[int, int], Path],
+    image_map: dict[tuple[str, int], Path],
     pages_per_file: int,
 ) -> str:
     badges = [
-        f'<span class="badge">file {candidate.file_id}</span>',
-        f'<span class="badge">parse {candidate.parse_job_id}</span>',
+        f'<span class="badge">disclosure {html.escape(candidate.disclosure_id)}</span>',
         f'<span class="badge">score {candidate.suspicion_score}</span>',
         f'<span class="badge">{len(candidate.pages)} page(s)</span>',
     ]
@@ -484,9 +468,9 @@ def _render_page_row(
     candidate: ParseReviewCandidate,
     page: ParsedPage,
     *,
-    image_map: dict[tuple[int, int], Path],
+    image_map: dict[tuple[str, int], Path],
 ) -> str:
-    image_path = image_map.get((candidate.file_id, page.page))
+    image_path = image_map.get((candidate.disclosure_id, page.page))
     image_html = (
         f'<img src="{html.escape(str(image_path))}" alt="PDF page {page.page}">'
         if image_path
