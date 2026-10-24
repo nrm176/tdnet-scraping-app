@@ -2,7 +2,9 @@
 immutable, content-addressed NDJSON manifests, one per raw_tdnet_history
 table. Never writes to any database. The legacy connection comes only
 from the DATABASE_URL environment variable already documented in
-.env.example -- never printed or persisted here.
+.env.example, falling back to tdnet.config's own DEFAULT_DATABASE_URL the
+same way tdnet.config.get_settings() does -- never printed or persisted
+here.
 
 All seven tables are read inside a single REPEATABLE READ READ ONLY
 transaction, so every manifest is a consistent snapshot of the same
@@ -13,12 +15,12 @@ import argparse
 import asyncio
 import hashlib
 import json
-import os
 import sys
 from pathlib import Path
 
 import asyncpg
 
+from tdnet.config import get_settings
 from tdnet.history_transform import (
     canonical_bytes,
     transform_analysis_result,
@@ -70,6 +72,18 @@ _TABLES = (
 
 class ExportError(ValueError):
     """A sanitized export failure."""
+
+
+def _normalize_database_url(database_url: str) -> str:
+    """Drop a SQLAlchemy-style `+driver` suffix from the scheme (e.g.
+    `postgresql+asyncpg://` -> `postgresql://`), since asyncpg.connect()
+    only accepts the bare `postgresql`/`postgres` scheme. tdnet.config's
+    DEFAULT_DATABASE_URL -- and so the repo's own DATABASE_URL convention
+    -- is written in the SQLAlchemy form everywhere else in this repo."""
+    scheme, separator, rest = database_url.partition("://")
+    if not separator:
+        return database_url
+    return f"{scheme.split('+', 1)[0]}://{rest}"
 
 
 async def _register_json_codecs(connection: asyncpg.Connection) -> None:
@@ -140,14 +154,15 @@ def main(argv=None) -> int:
         output_dir = Path(args.output_dir)
         if not output_dir.is_dir():
             raise ExportError("invalid output directory")
-        database_url = os.environ.get("DATABASE_URL")
-        if not database_url:
-            raise ExportError("DATABASE_URL is not set")
+        # Same resolution order as the rest of the repo (tdnet.config.get_settings):
+        # DATABASE_URL if set, else tdnet.config.DEFAULT_DATABASE_URL.
+        database_url = _normalize_database_url(get_settings().database_url)
         results = asyncio.run(_export_all(database_url, output_dir))
         print(json.dumps(results, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, allow_nan=False))
         return 0
-    except (ExportError, FileExistsError, OSError, asyncpg.PostgresError):
+    except (ExportError, FileExistsError, OSError, asyncpg.PostgresError,
+            asyncpg.exceptions.ClientConfigurationError):
         print("export_failed", file=sys.stderr)
         return 1
 

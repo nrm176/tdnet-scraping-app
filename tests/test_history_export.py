@@ -9,6 +9,7 @@ import pytest
 
 from tdnet.history_export import (
     ExportError,
+    _normalize_database_url,
     _write_manifest,
     main,
     manifest_digest,
@@ -97,11 +98,71 @@ def test_main_fails_closed_when_output_dir_missing(tmp_path, capsys):
     assert capsys.readouterr().err == "export_failed\n"
 
 
-def test_main_fails_closed_when_database_url_unset(tmp_path, monkeypatch, capsys):
+def test_normalize_database_url_strips_a_driver_suffix_from_the_scheme():
+    assert (_normalize_database_url("postgresql+asyncpg://tdnet:tdnet@localhost:55432/tdnet")
+            == "postgresql://tdnet:tdnet@localhost:55432/tdnet")
+
+
+def test_normalize_database_url_passes_through_a_bare_scheme_unchanged():
+    url = "postgresql://tdnet:tdnet@localhost:55432/tdnet"
+    assert _normalize_database_url(url) == url
+
+
+def test_normalize_database_url_passes_through_a_non_url_string_unchanged():
+    # No "://" to split on -- returned as-is so the eventual asyncpg.connect()
+    # failure (not this helper) reports the problem.
+    assert _normalize_database_url("not-a-url") == "not-a-url"
+
+
+def test_main_falls_back_to_tdnet_config_default_when_database_url_unset(tmp_path, monkeypatch):
+    """DATABASE_URL unset must fall back to tdnet.config's own
+    DEFAULT_DATABASE_URL (the same resolution tdnet.config.get_settings()
+    performs elsewhere in this repo), normalized to a bare asyncpg scheme --
+    never fail closed just because the env var wasn't exported. asyncpg.connect
+    is faked throughout, so this never reaches a real socket."""
+    import tdnet.history_export as export_module
+    from tdnet.config import DEFAULT_DATABASE_URL
+
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    seen = {}
+
+    class _FakeTransaction:
+        def __init__(self, **kwargs):
+            seen["transaction_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return False
+
+    class _FakeConnection:
+        async def set_type_codec(self, *args, **kwargs):
+            return None
+
+        def transaction(self, **kwargs):
+            return _FakeTransaction(**kwargs)
+
+        def cursor(self, query):
+            async def _empty():
+                return
+                yield  # pragma: no cover -- makes this an async generator
+
+            return _empty()
+
+        async def close(self):
+            return None
+
+    async def _fake_connect(url):
+        seen["connect_url"] = url
+        return _FakeConnection()
+
+    monkeypatch.setattr(export_module.asyncpg, "connect", _fake_connect)
     rc = main(["--output-dir", str(tmp_path)])
-    assert rc == 1
-    assert capsys.readouterr().err == "export_failed\n"
+    assert rc == 0
+    assert seen["connect_url"] == _normalize_database_url(DEFAULT_DATABASE_URL)
+    assert "+asyncpg" not in seen["connect_url"]
+    assert seen["transaction_kwargs"] == {"isolation": "repeatable_read", "readonly": True}
 
 
 def test_export_error_is_a_value_error():
