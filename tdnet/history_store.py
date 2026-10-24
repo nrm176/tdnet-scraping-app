@@ -12,6 +12,8 @@ test database), with the same current_database/current_user/server
 version and pipeline.instance_identity marker checks before any write."""
 from __future__ import annotations
 
+import json
+
 import asyncpg
 
 from tdnet.history_transform import (
@@ -167,7 +169,9 @@ def _build_insert(spec: dict, row_count: int) -> str:
         placeholders = []
         for column in columns:
             cast = casts.get(column)
-            placeholders.append(f"${index}::{cast}" if cast else f"${index}")
+            # Cast columns travel as text and PostgreSQL parses them: asyncpg otherwise
+            # infers the cast type and rejects the manifest's canonical ISO/JSON strings.
+            placeholders.append(f"${index}::text::{cast}" if cast else f"${index}")
             index += 1
         value_groups.append(f"({', '.join(placeholders)})")
     return (
@@ -177,12 +181,31 @@ def _build_insert(spec: dict, row_count: int) -> str:
     )
 
 
+# PostgreSQL's bind protocol caps one statement at 32,767 parameters.
+_MAX_PARAMS = 32767
+
+
+def _as_text(value):
+    """Text form for a ::text::<type> placeholder; NULL stays None."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    if isinstance(value, float):
+        return repr(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 def _row_values(row: dict, spec: dict, manifest_digest: str, migrated_at) -> list:
-    values = [row[spec["entry_id_column"]]]
-    values.extend(row[field] for field in spec["field_order"])
-    values.append(manifest_digest)
-    values.append(migrated_at)
-    return values
+    columns = [spec["entry_id_column"], *spec["field_order"], "migration_batch_id", "migrated_at"]
+    raw = [row[spec["entry_id_column"]], *(row[field] for field in spec["field_order"]),
+           manifest_digest, migrated_at]
+    casts = spec["column_types"]
+    return [_as_text(value) if casts.get(column) else value for column, value in zip(columns, raw)]
 
 
 def _parse_inserted_count(status: str) -> int:
@@ -205,17 +228,19 @@ async def _store_batch(table_key: str, rows: list, manifest_digest: str,
             await connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtext($1))", spec["lock_key"],
             )
-            if verified:
-                sql = _build_insert(spec, len(verified))
+            inserted = 0
+            width = len(spec["field_order"]) + 3
+            step = max(1, _MAX_PARAMS // width)
+            for start in range(0, len(verified), step):
+                chunk = verified[start:start + step]
+                sql = _build_insert(spec, len(chunk))
                 params = [
                     value
-                    for row in verified
+                    for row in chunk
                     for value in _row_values(row, spec, manifest_digest, migrated_at)
                 ]
                 status = await connection.execute(sql, *params)
-                inserted = _parse_inserted_count(status)
-            else:
-                inserted = 0
+                inserted += _parse_inserted_count(status)
     finally:
         await connection.close()
     return {"inserted": inserted, "skipped_existing": len(verified) - inserted, "total": len(verified)}

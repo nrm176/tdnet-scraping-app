@@ -228,3 +228,29 @@ async def test_store_parse_text_insert_casts_pages_json_as_jsonb():
         await store.store_parse_text_batch([_parse_text_row()], "8" * 64, _URL, _MIGRATED_AT)
     insert_sql = next(call[1] for call in connection.calls if call[1].startswith("INSERT"))
     assert "::jsonb" in insert_sql
+
+
+def test_cast_columns_bind_as_text_so_postgres_parses_them():
+    from datetime import datetime, timezone
+
+    from tdnet import history_store as hs
+
+    assert hs._as_text(None) is None
+    assert hs._as_text("2026-05-17T13:27:35.033429+00:00") == "2026-05-17T13:27:35.033429+00:00"
+    assert hs._as_text(True) == "true" and hs._as_text(False) == "false"
+    assert hs._as_text(7) == "7"
+    assert hs._as_text(0.1 + 0.2) == repr(0.1 + 0.2)
+    assert hs._as_text({"b": 1, "a": [1, "x"]}) == '{"a":[1,"x"],"b":1}'
+    assert hs._as_text(datetime(2026, 1, 2, tzinfo=timezone.utc)) == "2026-01-02T00:00:00+00:00"
+    spec = hs._TABLE_SPECS["report_tag"]
+    sql = hs._build_insert(spec, 1)
+    for column, cast in spec["column_types"].items():
+        assert f"::text::{cast}" in sql
+
+
+def test_statement_parameters_stay_under_the_protocol_limit():
+    from tdnet import history_store as hs
+
+    for spec in hs._TABLE_SPECS.values():
+        width = len(spec["field_order"]) + 3
+        assert (hs._MAX_PARAMS // width) * width <= 32767
