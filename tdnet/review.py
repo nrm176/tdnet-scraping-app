@@ -1,21 +1,38 @@
-"""Static visual review reports for parsed TDnet PDFs."""
+"""Static visual review reports for parsed TDnet PDFs.
+
+Reads `raw_tdnet_history.parse_job`/`file`/`disclosure`/`parse_text` as
+`research_reader`, instead of the legacy `tdnet` DB's ORM tables (Root spec
+2026-10-24, research DB migration slice 7, §3.4 phase B). This module never
+opens a connection to the legacy DB; PDF page images are still rendered from
+the SSD path the `file` table carries (`storage_path`) -- that's a
+filesystem read, not a DB one, and is unchanged.
+
+`research_reader` has `SELECT` on every `raw_tdnet_history` table (not just
+the SQL044 views), including `parse_text.pages_json` and `file.file_size_bytes`
+-- both missing from the views -- so candidate reconstruction (per-page
+markdown via `_pages_from_json`, the real `file_size_bytes` for
+`score_pages`' "large PDF, sparse text" check) is the same as the legacy ORM
+version, not a degraded approximation. `file.legacy_id`/`parse_job.legacy_id`
+map 1:1 to the legacy integer `disclosure_files.id`/`document_parse_jobs.id`,
+so `ParseReviewCandidate.file_id`/`.parse_job_id` and the HTML's badges are
+unchanged too.
+"""
 from __future__ import annotations
 
 import html
-import json
 import logging
 import random
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from .orm import DisclosureFileRecord, DisclosureRecord, DocumentParseJobRecord
+from . import history_queries
 from .parsers import PARSER_NAME, get_parser_version
+from .research_reader import run_read
 
 logger = logging.getLogger(__name__)
 
@@ -57,27 +74,6 @@ class ParseReviewReport:
     strategy: str
 
 
-def _load_pages(path: Path) -> list[ParsedPage]:
-    pages_path = path.with_name(path.name.replace(".md", ".pages.json"))
-    if not pages_path.exists():
-        return []
-    raw = json.loads(pages_path.read_text(encoding="utf-8"))
-    pages: list[ParsedPage] = []
-    for index, page in enumerate(raw.get("pages", []), 1):
-        if not isinstance(page, dict):
-            continue
-        markdown = str(page.get("markdown") or "")
-        page_number = page.get("page")
-        pages.append(
-            ParsedPage(
-                page=page_number if isinstance(page_number, int) else index,
-                markdown=markdown,
-                char_count=int(page.get("char_count") or len(markdown)),
-            )
-        )
-    return pages
-
-
 def _is_japanese_character(character: str) -> bool:
     codepoint = ord(character)
     return (
@@ -95,7 +91,7 @@ def _garbled_text_warnings(text: str) -> tuple[tuple[str, int], ...]:
     total_chars = len(text)
     japanese_chars = sum(1 for character in text if _is_japanese_character(character))
     control_chars = sum(1 for character in text if ord(character) < 32 and character not in _TEXT_WHITESPACE)
-    replacement_chars = text.count("\ufffd")
+    replacement_chars = text.count("�")
     latin1_symbol_chars = sum(1 for character in text if 0x80 <= ord(character) <= 0xFF)
     table_breaks = text.count("<br>")
 
@@ -148,66 +144,78 @@ def score_pages(
     return score, tuple(warnings or ("looks normal",))
 
 
+def _pages_from_json(pages_json: dict | None) -> list[ParsedPage]:
+    """Mirror the pre-cutover `_load_pages`, which read a sidecar
+    `<parser>.<version>.pages.json` file from disk: same per-page
+    `markdown`/`char_count`/`page` fallback rules, applied to the identical
+    JSON `parse_text.pages_json` now carries verbatim (`parse_texts.py`'s
+    `load_parse_text_payload` wrote that column from that same file,
+    unchanged, when the row was first created -- so this is the same bytes,
+    not a different shape). A parser whose own `.pages.json` has no
+    `markdown`/`char_count` key (e.g. apple-vision-ocr's line-box format)
+    produced an empty page here before this cutover too; that is unchanged.
+    """
+    if not pages_json:
+        return []
+    pages: list[ParsedPage] = []
+    for index, page in enumerate(pages_json.get("pages", []), 1):
+        if not isinstance(page, dict):
+            continue
+        markdown = str(page.get("markdown") or "")
+        page_number = page.get("page")
+        pages.append(
+            ParsedPage(
+                page=page_number if isinstance(page_number, int) else index,
+                markdown=markdown,
+                char_count=int(page.get("char_count") or len(markdown)),
+            )
+        )
+    return pages
+
+
+def _candidate_from_row(row: dict) -> ParseReviewCandidate:
+    pages = _pages_from_json(row["pages_json"])
+    score, warnings = score_pages(pages, file_size_bytes=row["file_size_bytes"])
+    return ParseReviewCandidate(
+        parse_job_id=row["parse_job_id"],
+        file_id=row["file_id"],
+        disclosure_id=row["disclosure_id"],
+        code=row["code"],
+        company_name=row["name"],
+        title=row["title"],
+        disclosure_date=str(row["disclosure_date"]),
+        pdf_path=Path(row["pdf_path"]) if row["pdf_path"] else Path(),
+        text_path=Path(row["text_path"]) if row["text_path"] else Path(),
+        parser_name=row["parser_name"],
+        parser_version=row["parser_version"],
+        file_size_bytes=row["file_size_bytes"],
+        pages=pages,
+        warnings=warnings,
+        suspicion_score=score,
+    )
+
+
 async def select_review_candidates(
-    session: AsyncSession,
     *,
     strategy: ReviewStrategy = "suspicious",
     limit: int = 50,
     parser_name: str = PARSER_NAME,
     parser_version: str | None = None,
+    engine: Optional[AsyncEngine] = None,
 ) -> list[ParseReviewCandidate]:
     version = parser_version or get_parser_version()
-    stmt = (
-        select(DocumentParseJobRecord, DisclosureFileRecord, DisclosureRecord)
-        .join(DisclosureFileRecord, DocumentParseJobRecord.file_id == DisclosureFileRecord.id)
-        .join(DisclosureRecord, DisclosureFileRecord.disclosure_id == DisclosureRecord.id)
-        .where(DocumentParseJobRecord.parse_status == "completed")
-        .where(DocumentParseJobRecord.parser_name == parser_name)
-        .where(DocumentParseJobRecord.parser_version == version)
-        .where(DocumentParseJobRecord.text_path.is_not(None))
-    )
 
-    if strategy == "random":
-        stmt = stmt.order_by(func.random()).limit(limit)
-    elif strategy == "recent":
-        stmt = stmt.order_by(DocumentParseJobRecord.parsed_at.desc(), DocumentParseJobRecord.id.desc()).limit(limit)
-    elif strategy == "forecast-correction":
-        stmt = (
-            stmt.where(
-                (DisclosureRecord.title.contains("業績予想"))
-                | (DisclosureRecord.title.contains("予想値"))
-            )
-            .order_by(DocumentParseJobRecord.parsed_at.desc(), DocumentParseJobRecord.id.desc())
-            .limit(limit)
+    async def _do(conn):
+        return await history_queries.fetch_review_candidates(
+            conn,
+            strategy=strategy,
+            limit=limit,
+            parser_name=parser_name,
+            parser_version=version,
         )
-    else:
-        stmt = stmt.order_by(DocumentParseJobRecord.parsed_at.desc(), DocumentParseJobRecord.id.desc()).limit(limit * 20)
 
-    rows = (await session.execute(stmt)).all()
-    candidates: list[ParseReviewCandidate] = []
-    for parse_job, file_record, disclosure in rows:
-        text_path = Path(parse_job.text_path)
-        pages = _load_pages(text_path)
-        score, warnings = score_pages(pages, file_size_bytes=file_record.file_size_bytes)
-        candidates.append(
-            ParseReviewCandidate(
-                parse_job_id=parse_job.id,
-                file_id=file_record.id,
-                disclosure_id=disclosure.id,
-                code=disclosure.code,
-                company_name=disclosure.name,
-                title=disclosure.title,
-                disclosure_date=str(disclosure.disclosure_date),
-                pdf_path=Path(file_record.storage_path),
-                text_path=text_path,
-                parser_name=parse_job.parser_name,
-                parser_version=parse_job.parser_version,
-                file_size_bytes=file_record.file_size_bytes,
-                pages=pages,
-                warnings=warnings,
-                suspicion_score=score,
-            )
-        )
+    rows = await run_read(_do, engine=engine)
+    candidates = [_candidate_from_row(row) for row in rows]
 
     if strategy == "suspicious":
         candidates.sort(key=lambda candidate: candidate.suspicion_score, reverse=True)
@@ -241,7 +249,6 @@ def render_pdf_page(pdf_path: Path, page_number: int, destination: Path, *, zoom
 
 
 async def build_parse_review_report(
-    session: AsyncSession,
     *,
     output_root: Path = Path("parse-reviews"),
     strategy: ReviewStrategy = "suspicious",
@@ -250,13 +257,14 @@ async def build_parse_review_report(
     parser_name: str = PARSER_NAME,
     parser_version: str | None = None,
     open_report: bool = False,
+    engine: Optional[AsyncEngine] = None,
 ) -> ParseReviewReport:
     candidates = await select_review_candidates(
-        session,
         strategy=strategy,
         limit=limit,
         parser_name=parser_name,
         parser_version=parser_version,
+        engine=engine,
     )
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = output_root / stamp

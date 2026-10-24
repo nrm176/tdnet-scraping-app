@@ -1,4 +1,16 @@
-"""FastAPI application for persisted TDnet disclosures."""
+"""FastAPI application for persisted TDnet disclosures.
+
+Reads the research DB's migrated TDnet history (`raw_tdnet_history.*` and
+the SQL044 `analysis.tdnet_disclosure_history_v1` view) as `research_reader`,
+instead of the legacy `tdnet` DB's ORM tables (Root spec 2026-10-24, research
+DB migration slice 7, §3.4 phase B). This app never opens a connection to
+the legacy DB. `research_reader` has `SELECT` on every `raw_tdnet_history`
+table, so every endpoint here returns the same data it did against legacy --
+see `tdnet/history_queries.py`'s module docstring for exactly which table
+backs which field. The one legacy table that was never migrated,
+`document_parse_reviews`, was already empty (ruling T2), so there is nothing
+to lose there either.
+"""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -9,36 +21,22 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncConnection
 
+from . import history_queries
 from .config import get_settings
-from .database import get_session, init_db
 from .models import TdnetDisclosure
-from .orm import (
-    DisclosureFileRecord,
-    DisclosureRecord,
-    DocumentAnalysisResultRecord,
-    DocumentParseJobRecord,
-    DocumentParseTextRecord,
-    ReportTagAssignmentRecord,
-    ReportTagRecord,
-)
-from .repository import (
-    count_disclosure_files,
-    count_disclosures,
-    disclosure_from_record,
-    get_disclosure,
-    query_disclosure_files,
-    query_disclosures,
-)
+from .research_reader import get_research_connection
 
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    await init_db()
+    # The research reader engine is created lazily on first connection
+    # (research_reader.get_engine); there is no legacy-DB table setup to run
+    # here any more.
     yield
 
 
@@ -214,198 +212,157 @@ class ReportTagSummaryListResponse(BaseModel):
     tags: list[ReportTagSummaryResponse] = Field(default_factory=list)
 
 
-def _parse_text_summary(record: DocumentParseTextRecord | None) -> ParseTextSummaryResponse | None:
-    if record is None:
+def _disclosure_from_row(row: dict) -> TdnetDisclosure:
+    return TdnetDisclosure(
+        time=row["time"],
+        code=row["code"],
+        name=row["name"],
+        title=row["title"],
+        pdf_url=row["pdf_url"],
+        xbrl_available=row["xbrl_available"],
+        xbrl_url=row["xbrl_url"],
+        place=row["place"],
+        history=row["history"],
+        disclosure_date=row["disclosure_date"],
+    )
+
+
+def _tag_assignment_from_row(row: dict) -> ReportTagAssignmentLineageResponse:
+    return ReportTagAssignmentLineageResponse(
+        slug=row["tag_slug"],
+        label_ja=row["label_ja"],
+        label_en=row["label_en"],
+        is_primary=row["is_primary"],
+        confidence=row["confidence"],
+        source=row["source"],
+        file_id=row["file_id"],
+        parse_job_id=row["parse_job_id"],
+        evidence_json=row["evidence_json"],
+        tagger_name=row["tagger_name"],
+        tagger_version=row["tagger_version"],
+    )
+
+
+def _file_response_from_row(row: dict) -> DisclosureFileResponse:
+    return DisclosureFileResponse(
+        id=row["id"],
+        disclosure_id=row["disclosure_id"],
+        file_type=row["file_type"],
+        source_url=row["source_url"],
+        source_file_id=row["source_file_id"],
+        storage_bucket=row["storage_bucket"],
+        storage_path=row["storage_path"],
+        content_type=row["content_type"],
+        file_size_bytes=row["file_size_bytes"],
+        sha256=row["sha256"],
+        download_status=row["download_status"],
+        download_attempts=row["download_attempts"],
+        downloaded_at=row["downloaded_at"],
+        last_download_error=row["last_download_error"],
+    )
+
+
+def _parse_text_summary_from_row(row: dict) -> ParseTextSummaryResponse | None:
+    if row["text_id"] is None:
         return None
     return ParseTextSummaryResponse(
-        id=record.id,
-        parse_job_id=record.parse_job_id,
-        page_count=record.page_count,
-        char_count=record.char_count,
-        content_sha256=record.content_sha256,
-        created_at=record.created_at,
-        updated_at=record.updated_at,
+        id=row["text_id"],
+        parse_job_id=row["id"],
+        page_count=row["text_page_count"],
+        char_count=row["text_char_count"],
+        content_sha256=row["text_content_sha256"],
+        created_at=row["text_created_at"],
+        updated_at=row["text_updated_at"],
     )
 
 
-def _parse_job_lineage(
-    record: DocumentParseJobRecord,
-    parse_text: DocumentParseTextRecord | None,
-) -> ParseJobLineageResponse:
+def _parse_job_from_row(row: dict) -> ParseJobLineageResponse:
     return ParseJobLineageResponse(
-        id=record.id,
-        file_id=record.file_id,
-        parser_name=record.parser_name,
-        parser_version=record.parser_version,
-        parse_status=record.parse_status,
-        parse_attempts=record.parse_attempts,
-        text_path=record.text_path,
-        text_sha256=record.text_sha256,
-        parsed_at=record.parsed_at,
-        last_parse_error=record.last_parse_error,
-        parse_text=_parse_text_summary(parse_text),
+        id=row["id"],
+        file_id=row["file_id"],
+        parser_name=row["parser_name"],
+        parser_version=row["parser_version"],
+        parse_status=row["parse_status"],
+        parse_attempts=row["parse_attempts"],
+        text_path=row["text_path"],
+        text_sha256=row["text_sha256"],
+        parsed_at=row["parsed_at"],
+        last_parse_error=row["last_parse_error"],
+        parse_text=_parse_text_summary_from_row(row),
     )
 
 
-def _analysis_result_response(record: DocumentAnalysisResultRecord) -> AnalysisResultResponse:
+def _analysis_result_from_row(row: dict) -> AnalysisResultResponse:
     return AnalysisResultResponse(
-        id=record.id,
-        file_id=record.file_id,
-        parse_job_id=record.parse_job_id,
-        analysis_type=record.analysis_type,
-        analyzer_name=record.analyzer_name,
-        analyzer_version=record.analyzer_version,
-        status=record.status,
-        result_json=record.result_json,
-        result_text=record.result_text,
-        analyzed_at=record.analyzed_at,
-        last_analysis_error=record.last_analysis_error,
-        created_at=record.created_at,
-        updated_at=record.updated_at,
+        id=row["id"],
+        file_id=row["file_id"],
+        parse_job_id=row["parse_job_id"],
+        analysis_type=row["analysis_type"],
+        analyzer_name=row["analyzer_name"],
+        analyzer_version=row["analyzer_version"],
+        status=row["status"],
+        result_json=row["result_json"],
+        result_text=row["result_text"],
+        analyzed_at=row["analyzed_at"],
+        last_analysis_error=row["last_analysis_error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
-def _tag_assignment_response(
-    assignment: ReportTagAssignmentRecord,
-    tag: ReportTagRecord,
-) -> ReportTagAssignmentLineageResponse:
-    return ReportTagAssignmentLineageResponse(
-        slug=assignment.tag_slug,
-        label_ja=tag.label_ja,
-        label_en=tag.label_en,
-        is_primary=assignment.is_primary,
-        confidence=assignment.confidence,
-        source=assignment.source,
-        file_id=assignment.file_id,
-        parse_job_id=assignment.parse_job_id,
-        evidence_json=assignment.evidence_json,
-        tagger_name=assignment.tagger_name,
-        tagger_version=assignment.tagger_version,
-    )
-
-
-def _file_lineage_response(
-    record: DisclosureFileRecord,
-    *,
-    parse_jobs: list[ParseJobLineageResponse] | None = None,
-    analysis_results: list[AnalysisResultResponse] | None = None,
-) -> DisclosureFileLineageResponse:
-    return DisclosureFileLineageResponse(
-        **DisclosureFileResponse.model_validate(record, from_attributes=True).model_dump(),
-        parse_jobs=parse_jobs or [],
-        analysis_results=analysis_results or [],
-    )
-
-
-def _sum_when(condition) -> object:
-    return func.sum(case((condition, 1), else_=0))
-
-
-async def _load_lineage(
-    session: AsyncSession,
-    disclosure_records: list[DisclosureRecord],
-) -> dict[str, DisclosureLineageResponse]:
-    if not disclosure_records:
+async def _load_lineage(conn: AsyncConnection, disclosure_rows: list[dict]) -> dict[str, DisclosureLineageResponse]:
+    """Mirror the legacy ORM's `_load_lineage`: one query per table, batched
+    across every disclosure in `disclosure_rows`, then assembled in Python --
+    just reading `raw_tdnet_history.*` instead of the ORM session."""
+    if not disclosure_rows:
         return {}
 
-    disclosure_ids = [record.id for record in disclosure_records]
-    file_records = list(
-        (
-            await session.scalars(
-                select(DisclosureFileRecord)
-                .where(DisclosureFileRecord.disclosure_id.in_(disclosure_ids))
-                .order_by(
-                    DisclosureFileRecord.disclosure_id.asc(),
-                    DisclosureFileRecord.file_type.asc(),
-                    DisclosureFileRecord.id.asc(),
-                )
-            )
-        ).all()
-    )
-    file_ids = [record.id for record in file_records]
+    disclosure_ids = [row["disclosure_id"] for row in disclosure_rows]
+    file_rows = await history_queries.fetch_files_for_disclosures(conn, disclosure_ids)
+    file_legacy_ids = [row["id"] for row in file_rows]
 
     parse_jobs_by_file: dict[int, list[ParseJobLineageResponse]] = defaultdict(list)
     analysis_results_by_file: dict[int, list[AnalysisResultResponse]] = defaultdict(list)
-    if file_ids:
-        parse_rows = (
-            await session.execute(
-                select(DocumentParseJobRecord, DocumentParseTextRecord)
-                .outerjoin(
-                    DocumentParseTextRecord,
-                    DocumentParseTextRecord.parse_job_id == DocumentParseJobRecord.id,
-                )
-                .where(DocumentParseJobRecord.file_id.in_(file_ids))
-                .order_by(
-                    DocumentParseJobRecord.file_id.asc(),
-                    DocumentParseJobRecord.parser_name.asc(),
-                    DocumentParseJobRecord.parser_version.desc(),
-                    DocumentParseJobRecord.id.asc(),
-                )
-            )
-        ).all()
-        for parse_job, parse_text in parse_rows:
-            parse_jobs_by_file[parse_job.file_id].append(_parse_job_lineage(parse_job, parse_text))
-
-        analysis_records = (
-            await session.scalars(
-                select(DocumentAnalysisResultRecord)
-                .where(DocumentAnalysisResultRecord.file_id.in_(file_ids))
-                .order_by(
-                    DocumentAnalysisResultRecord.file_id.asc(),
-                    DocumentAnalysisResultRecord.analysis_type.asc(),
-                    DocumentAnalysisResultRecord.id.asc(),
-                )
-            )
-        ).all()
-        for analysis_record in analysis_records:
-            analysis_results_by_file[analysis_record.file_id].append(_analysis_result_response(analysis_record))
+    if file_legacy_ids:
+        for parse_job_row in await history_queries.fetch_parse_jobs_for_files(conn, file_legacy_ids):
+            parse_jobs_by_file[parse_job_row["file_id"]].append(_parse_job_from_row(parse_job_row))
+        for analysis_row in await history_queries.fetch_analysis_results_for_files(conn, file_legacy_ids):
+            analysis_results_by_file[analysis_row["file_id"]].append(_analysis_result_from_row(analysis_row))
 
     files_by_disclosure: dict[str, list[DisclosureFileLineageResponse]] = defaultdict(list)
-    for file_record in file_records:
-        files_by_disclosure[file_record.disclosure_id].append(
-            _file_lineage_response(
-                file_record,
-                parse_jobs=parse_jobs_by_file[file_record.id],
-                analysis_results=analysis_results_by_file[file_record.id],
+    for file_row in file_rows:
+        files_by_disclosure[file_row["disclosure_id"]].append(
+            DisclosureFileLineageResponse(
+                **_file_response_from_row(file_row).model_dump(),
+                parse_jobs=parse_jobs_by_file[file_row["id"]],
+                analysis_results=analysis_results_by_file[file_row["id"]],
             )
         )
 
-    tag_rows = (
-        await session.execute(
-            select(ReportTagAssignmentRecord, ReportTagRecord)
-            .join(ReportTagRecord, ReportTagRecord.slug == ReportTagAssignmentRecord.tag_slug)
-            .where(ReportTagAssignmentRecord.disclosure_id.in_(disclosure_ids))
-            .order_by(
-                ReportTagAssignmentRecord.disclosure_id.asc(),
-                ReportTagAssignmentRecord.is_primary.desc(),
-                ReportTagRecord.priority.asc(),
-                ReportTagRecord.slug.asc(),
-            )
-        )
-    ).all()
+    tag_rows = await history_queries.fetch_tags_for_disclosures(conn, disclosure_ids)
     tags_by_disclosure: dict[str, list[ReportTagAssignmentLineageResponse]] = defaultdict(list)
-    for assignment, tag in tag_rows:
-        tags_by_disclosure[assignment.disclosure_id].append(_tag_assignment_response(assignment, tag))
+    for tag_row in tag_rows:
+        tags_by_disclosure[tag_row["disclosure_id"]].append(_tag_assignment_from_row(tag_row))
 
     return {
-        disclosure_record.id: DisclosureLineageResponse(
-            disclosure=disclosure_from_record(disclosure_record),
-            tags=tags_by_disclosure[disclosure_record.id],
-            files=files_by_disclosure[disclosure_record.id],
+        disclosure_row["disclosure_id"]: DisclosureLineageResponse(
+            disclosure=_disclosure_from_row(disclosure_row),
+            tags=tags_by_disclosure[disclosure_row["disclosure_id"]],
+            files=files_by_disclosure[disclosure_row["disclosure_id"]],
         )
-        for disclosure_record in disclosure_records
+        for disclosure_row in disclosure_rows
     }
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health(session: Annotated[AsyncSession, Depends(get_session)]) -> HealthResponse:
-    await session.execute(text("select 1"))
+async def health(conn: Annotated[AsyncConnection, Depends(get_research_connection)]) -> HealthResponse:
+    await conn.execute(text("SELECT 1"))
     return HealthResponse(status="ok", database="ok")
 
 
 @app.get("/disclosures", response_model=DisclosureListResponse)
 async def list_disclosures(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
     disclosure_date: Annotated[date | None, Query(alias="date")] = None,
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
@@ -413,15 +370,15 @@ async def list_disclosures(
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DisclosureListResponse:
-    total = await count_disclosures(
-        session,
+    total = await history_queries.count_disclosures(
+        conn,
         disclosure_date=disclosure_date,
         date_from=date_from,
         date_to=date_to,
         code=code,
     )
-    disclosures = await query_disclosures(
-        session,
+    rows = await history_queries.fetch_disclosures(
+        conn,
         disclosure_date=disclosure_date,
         date_from=date_from,
         date_to=date_to,
@@ -433,62 +390,62 @@ async def list_disclosures(
         total=total,
         limit=limit,
         offset=offset,
-        disclosures=disclosures,
+        disclosures=[_disclosure_from_row(row) for row in rows],
     )
 
 
 @app.get("/disclosures/{disclosure_id}", response_model=TdnetDisclosure)
 async def read_disclosure(
     disclosure_id: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
 ) -> TdnetDisclosure:
-    disclosure = await get_disclosure(session, disclosure_id)
-    if disclosure is None:
+    row = await history_queries.fetch_disclosure(conn, disclosure_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Disclosure not found")
-    return disclosure
+    return _disclosure_from_row(row)
 
 
 @app.get("/disclosures/{disclosure_id}/lineage", response_model=DisclosureLineageResponse)
 async def read_disclosure_lineage(
     disclosure_id: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
 ) -> DisclosureLineageResponse:
-    record = await session.get(DisclosureRecord, disclosure_id)
-    if record is None:
+    row = await history_queries.fetch_disclosure(conn, disclosure_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Disclosure not found")
-    lineage = await _load_lineage(session, [record])
+    lineage = await _load_lineage(conn, [row])
     return lineage[disclosure_id]
 
 
 @app.get("/disclosures/{disclosure_id}/parser-status", response_model=ParserStatusResponse)
 async def read_disclosure_parser_status(
     disclosure_id: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
 ) -> ParserStatusResponse:
-    record = await session.get(DisclosureRecord, disclosure_id)
-    if record is None:
+    row = await history_queries.fetch_disclosure(conn, disclosure_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="Disclosure not found")
-    lineage = await _load_lineage(session, [record])
+    lineage = await _load_lineage(conn, [row])
     return ParserStatusResponse(disclosure_id=disclosure_id, files=lineage[disclosure_id].files)
 
 
 @app.get("/disclosure-files", response_model=DisclosureFileListResponse)
 async def list_disclosure_files(
-    session: Annotated[AsyncSession, Depends(get_session)],
-    disclosure_id: str | None = None,
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
     download_status: str | None = None,
     file_type: str | None = None,
+    disclosure_id: str | None = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DisclosureFileListResponse:
-    total = await count_disclosure_files(
-        session,
+    total = await history_queries.count_disclosure_files(
+        conn,
         disclosure_id=disclosure_id,
         download_status=download_status,
         file_type=file_type,
     )
-    records = await query_disclosure_files(
-        session,
+    rows = await history_queries.fetch_disclosure_files(
+        conn,
         disclosure_id=disclosure_id,
         download_status=download_status,
         file_type=file_type,
@@ -499,27 +456,27 @@ async def list_disclosure_files(
         total=total,
         limit=limit,
         offset=offset,
-        files=[DisclosureFileResponse.model_validate(record, from_attributes=True) for record in records],
+        files=[_file_response_from_row(row) for row in rows],
     )
 
 
 @app.get("/companies/{code}/disclosures", response_model=DisclosureListResponse)
 async def list_company_disclosures(
     code: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DisclosureListResponse:
-    total = await count_disclosures(
-        session,
+    total = await history_queries.count_disclosures(
+        conn,
         date_from=date_from,
         date_to=date_to,
         code=code,
     )
-    disclosures = await query_disclosures(
-        session,
+    rows = await history_queries.fetch_disclosures(
+        conn,
         date_from=date_from,
         date_to=date_to,
         code=code,
@@ -530,47 +487,39 @@ async def list_company_disclosures(
         total=total,
         limit=limit,
         offset=offset,
-        disclosures=disclosures,
+        disclosures=[_disclosure_from_row(row) for row in rows],
     )
 
 
 @app.get("/companies/{code}/timeline", response_model=CompanyTimelineResponse)
 async def read_company_timeline(
     code: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
     limit: Annotated[int, Query(ge=1, le=1000)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> CompanyTimelineResponse:
     normalized_code = code.strip().upper()
-    total = await count_disclosures(
-        session,
+    total = await history_queries.count_disclosures(
+        conn,
         date_from=date_from,
         date_to=date_to,
         code=normalized_code,
     )
-    stmt = select(DisclosureRecord).where(DisclosureRecord.code == normalized_code)
-    if date_from is not None:
-        stmt = stmt.where(DisclosureRecord.disclosure_date >= date_from)
-    if date_to is not None:
-        stmt = stmt.where(DisclosureRecord.disclosure_date <= date_to)
-    stmt = (
-        stmt.order_by(
-            DisclosureRecord.disclosure_date.desc(),
-            DisclosureRecord.time.desc(),
-            DisclosureRecord.id.asc(),
-        )
-        .limit(limit)
-        .offset(offset)
+    rows = await history_queries.fetch_disclosures(
+        conn,
+        date_from=date_from,
+        date_to=date_to,
+        code=normalized_code,
+        limit=limit,
+        offset=offset,
     )
-    disclosure_records = list(
-        (await session.scalars(stmt)).all()
-    )
-    lineage_by_disclosure = await _load_lineage(session, disclosure_records)
+    lineage_by_disclosure = await _load_lineage(conn, rows)
+
     timeline_items: list[CompanyTimelineDisclosureResponse] = []
-    for disclosure_record in disclosure_records:
-        lineage = lineage_by_disclosure[disclosure_record.id]
+    for row in rows:
+        lineage = lineage_by_disclosure[row["disclosure_id"]]
         parse_job_count = sum(len(file.parse_jobs) for file in lineage.files)
         completed_parse_job_count = sum(
             1 for file in lineage.files for parse_job in file.parse_jobs if parse_job.parse_status == "completed"
@@ -600,122 +549,58 @@ async def read_company_timeline(
 
 @app.get("/parser-quality", response_model=ParserQualityResponse)
 async def read_parser_quality(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
 ) -> ParserQualityResponse:
-    total_stmt = (
-        select(
-            func.count(DocumentParseJobRecord.id),
-            _sum_when(DocumentParseJobRecord.parse_status == "completed"),
-            _sum_when(DocumentParseJobRecord.parse_status == "failed"),
-            _sum_when(DocumentParseJobRecord.parse_status == "running"),
-            _sum_when(DocumentParseJobRecord.parse_status == "pending"),
-            func.count(DocumentParseTextRecord.id),
-        )
-        .select_from(DocumentParseJobRecord)
-        .outerjoin(DocumentParseTextRecord, DocumentParseTextRecord.parse_job_id == DocumentParseJobRecord.id)
-    )
-    total_jobs, completed_jobs, failed_jobs, running_jobs, pending_jobs, parse_texts = (
-        await session.execute(total_stmt)
-    ).one()
-
-    status_rows = (
-        await session.execute(
-            select(DocumentParseJobRecord.parse_status, func.count(DocumentParseJobRecord.id))
-            .group_by(DocumentParseJobRecord.parse_status)
-            .order_by(DocumentParseJobRecord.parse_status.asc())
-        )
-    ).all()
-    parser_rows = (
-        await session.execute(
-            select(
-                DocumentParseJobRecord.parser_name,
-                DocumentParseJobRecord.parser_version,
-                func.count(DocumentParseJobRecord.id),
-                _sum_when(DocumentParseJobRecord.parse_status == "completed"),
-                _sum_when(DocumentParseJobRecord.parse_status == "failed"),
-                _sum_when(DocumentParseJobRecord.parse_status == "running"),
-                _sum_when(DocumentParseJobRecord.parse_status == "pending"),
-                func.count(DocumentParseTextRecord.id),
-                func.avg(DocumentParseTextRecord.char_count),
-            )
-            .select_from(DocumentParseJobRecord)
-            .outerjoin(DocumentParseTextRecord, DocumentParseTextRecord.parse_job_id == DocumentParseJobRecord.id)
-            .group_by(DocumentParseJobRecord.parser_name, DocumentParseJobRecord.parser_version)
-            .order_by(DocumentParseJobRecord.parser_name.asc(), DocumentParseJobRecord.parser_version.desc())
-        )
-    ).all()
+    totals = await history_queries.fetch_parser_totals(conn)
+    status_rows = await history_queries.fetch_parser_status_counts(conn)
+    breakdown = await history_queries.fetch_parser_breakdown(conn)
     return ParserQualityResponse(
-        total_jobs=int(total_jobs or 0),
-        completed_jobs=int(completed_jobs or 0),
-        failed_jobs=int(failed_jobs or 0),
-        running_jobs=int(running_jobs or 0),
-        pending_jobs=int(pending_jobs or 0),
-        parse_texts=int(parse_texts or 0),
+        total_jobs=totals["total_jobs"],
+        completed_jobs=totals["completed_jobs"],
+        failed_jobs=totals["failed_jobs"],
+        running_jobs=totals["running_jobs"],
+        pending_jobs=totals["pending_jobs"],
+        parse_texts=totals["parse_texts"],
         status_counts=[
-            ParserQualityStatusCount(parse_status=parse_status, count=int(count or 0))
-            for parse_status, count in status_rows
+            ParserQualityStatusCount(parse_status=row["parse_status"], count=row["count"])
+            for row in status_rows
         ],
         parsers=[
             ParserQualityParserResponse(
-                parser_name=parser_name,
-                parser_version=parser_version,
-                total_jobs=int(total or 0),
-                completed_jobs=int(completed or 0),
-                failed_jobs=int(failed or 0),
-                running_jobs=int(running or 0),
-                pending_jobs=int(pending or 0),
-                parse_texts=int(texts or 0),
-                average_char_count=float(average_chars) if average_chars is not None else None,
+                parser_name=row["parser_name"],
+                parser_version=row["parser_version"],
+                total_jobs=row["total_jobs"],
+                completed_jobs=row["completed_jobs"],
+                failed_jobs=row["failed_jobs"],
+                running_jobs=row["running_jobs"],
+                pending_jobs=row["pending_jobs"],
+                parse_texts=row["parse_texts"],
+                average_char_count=(
+                    float(row["average_char_count"]) if row["average_char_count"] is not None else None
+                ),
             )
-            for (
-                parser_name,
-                parser_version,
-                total,
-                completed,
-                failed,
-                running,
-                pending,
-                texts,
-                average_chars,
-            ) in parser_rows
+            for row in breakdown
         ],
     )
 
 
 @app.get("/tags", response_model=ReportTagSummaryListResponse)
 async def read_tag_summaries(
-    session: Annotated[AsyncSession, Depends(get_session)],
+    conn: Annotated[AsyncConnection, Depends(get_research_connection)],
 ) -> ReportTagSummaryListResponse:
-    tag_records = (
-        await session.scalars(
-            select(ReportTagRecord).order_by(ReportTagRecord.priority.asc(), ReportTagRecord.slug.asc())
-        )
-    ).all()
-    count_rows = (
-        await session.execute(
-            select(
-                ReportTagAssignmentRecord.tag_slug,
-                func.count(ReportTagAssignmentRecord.id),
-                _sum_when(ReportTagAssignmentRecord.is_primary.is_(True)),
-            ).group_by(ReportTagAssignmentRecord.tag_slug)
-        )
-    ).all()
-    counts = {
-        tag_slug: (int(assignment_count or 0), int(primary_count or 0))
-        for tag_slug, assignment_count, primary_count in count_rows
-    }
+    rows = await history_queries.fetch_tag_summaries(conn)
     return ReportTagSummaryListResponse(
         tags=[
             ReportTagSummaryResponse(
-                slug=record.slug,
-                label_ja=record.label_ja,
-                label_en=record.label_en,
-                description=record.description,
-                priority=record.priority,
-                active=record.active,
-                assignment_count=counts.get(record.slug, (0, 0))[0],
-                primary_count=counts.get(record.slug, (0, 0))[1],
+                slug=row["slug"],
+                label_ja=row["label_ja"],
+                label_en=row["label_en"],
+                description=row["description"],
+                priority=row["priority"],
+                active=row["active"],
+                assignment_count=row["assignment_count"],
+                primary_count=row["primary_count"],
             )
-            for record in tag_records
+            for row in rows
         ]
     )
