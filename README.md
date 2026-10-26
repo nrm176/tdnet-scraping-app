@@ -1,3 +1,5 @@
+> **Moved (2026-10-26):** this repository now lives in hedge-fund-takedo under `sources/tdnet/`, with its full history. That repository is private. This repo is archived; its history and branches stay here.
+
 # TDnet Scraping Application
 
 Canonical TDnet service for scraping Japanese disclosure metadata, persisting it
